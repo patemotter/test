@@ -340,11 +340,12 @@ def fp8_quantized_matmul_2d_kernel(
     weights and activations are quantized in blocks of size
     (quant_block_size, quant_block_size).
 
-    SIMPLIFIED ALIGNED-BLOCK APPROACH FOR MAXIMUM PERFORMANCE:
-    - **Kernel blocks = quantization blocks**: Each kernel processes exactly one block
+    PERFORMANCE-CRITICAL OPTIMIZATIONS:
     - **Native fp8×fp8 matmul**: Leverages hardware fp8 MXU for maximum speed
+    - **DOUBLE BUFFERING**: Automatic prefetching overlaps compute with memory transfers
+    - **Kernel blocks = quantization blocks**: Each kernel processes exactly one block (aligned mode)
     - **Simple scale application**: One scale per kernel, just scalar multiply at end
-    - **No sub-block iteration**: Simpler code, easier to verify, less overhead
+    - **No sub-block iteration**: Simpler code, easier to verify, less overhead (aligned mode)
     - **Static block sizes**: All dimensions are compile-time constants for TPU compiler
     - **Proper memory layout**: Ensures (8x128) divisibility for TPU constraints
     - **VMEM efficient**: Each kernel uses ~1MB for 512×512 blocks, well within 64MB limit
@@ -353,6 +354,7 @@ def fp8_quantized_matmul_2d_kernel(
     - Uses native fp8×fp8 → fp32 accumulation in hardware (vs fp32×fp32)
     - Minimal scaling overhead (scalar multiplication vs array broadcasting)
     - More kernel invocations but each is highly optimized
+    - Double buffering hides memory latency behind computation
 
     Args:
         x: Input unquantized or pre-quantized array [batch_size, n_in]
@@ -531,6 +533,10 @@ def fp8_quantized_matmul_2d_kernel(
         n_x_blocks_m = 1
         n_x_blocks_n = 1
 
+        # CRITICAL: PrefetchScalarGridSpec enables AUTOMATIC DOUBLE BUFFERING
+        # This overlaps compute with memory transfers for maximum TPU performance.
+        # The compiler automatically prefetches the next iteration's data while
+        # computing the current iteration.
         kernel = pl.pallas_call(
             functools.partial(
                 matmul_kernel_2d,
@@ -597,6 +603,10 @@ def fp8_quantized_matmul_2d_kernel(
         n_x_blocks_m = batch_block_size // quant_block_size
         n_x_blocks_n = in_block_size // quant_block_size
 
+        # CRITICAL: PrefetchScalarGridSpec enables AUTOMATIC DOUBLE BUFFERING
+        # This overlaps compute with memory transfers for maximum TPU performance.
+        # The compiler automatically prefetches the next iteration's data while
+        # computing the current iteration.
         kernel = pl.pallas_call(
             functools.partial(
                 matmul_kernel_2d_large_blocks,

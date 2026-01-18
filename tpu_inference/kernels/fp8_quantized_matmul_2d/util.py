@@ -267,12 +267,16 @@ def get_vmem_limit(
     vmem_in_out = x_size + x_abs_max_size + w_q_size + w_scale_size + out_size
     vmem_in_out *= 2  # Account for compute and vreg spills
 
-    # Account for double buffering
-    vmem_in_out += x_size if (n_batch > 1 or n_in > 1) else 0
-    vmem_in_out += x_abs_max_size if (n_batch > 1) else 0
-    vmem_in_out += w_q_size if (n_out > 1 or n_in > 1) else 0
-    vmem_in_out += w_scale_size if (n_out > 1) else 0
-    vmem_in_out += out_size if (n_batch > 1 or n_out > 1) else 0
+    # CRITICAL PERFORMANCE: Account for double buffering
+    # Double buffering is ESSENTIAL for maximizing TPU performance by overlapping
+    # compute with memory transfers. With PrefetchScalarGridSpec, the compiler
+    # automatically double buffers inputs when there are multiple grid iterations.
+    # We allocate extra VMEM here to enable this:
+    vmem_in_out += x_size if (n_batch > 1 or n_in > 1) else 0  # DB activations
+    vmem_in_out += x_abs_max_size if (n_batch > 1) else 0  # DB act abs_max
+    vmem_in_out += w_q_size if (n_out > 1 or n_in > 1) else 0  # DB weights
+    vmem_in_out += w_scale_size if (n_out > 1) else 0  # DB weight scales
+    vmem_in_out += out_size if (n_batch > 1 or n_out > 1) else 0  # DB outputs
 
     # Calculate scratch VMEM size
     acc_size = batch_block_size * out_block_size * get_bits(acc_dtype)
