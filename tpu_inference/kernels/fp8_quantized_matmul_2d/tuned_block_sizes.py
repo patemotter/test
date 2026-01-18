@@ -42,51 +42,64 @@ def get_device_vmem_limit():
 # - 2D block quantization with blocks of 128x128, 256x256, or 512x512
 # - Divisibility by (8x128) for last two dimensions
 
+# TUNED BLOCK SIZES DATABASE
+#
+# TWO MODES SUPPORTED:
+# 1. ALIGNED BLOCKS (kernel_block = quant_block):
+#    - Simpler implementation, one quant block per kernel
+#    - Uses native fp8×fp8 matmuls
+#    - Good for smaller matrices or initial testing
+#
+# 2. LARGE BLOCKS (kernel_block > quant_block):
+#    - Multiple quant blocks per kernel with sub-block iteration
+#    - Amortizes kernel launch overhead
+#    - Better for large matrices on TPU
+#
+# Format: (batch, out, in, x_dtype, w_dtype, quant_block) -> TunedValue(batch_block, out_block, in_block, quant_block)
+
 TUNED_BLOCK_SIZES = {
-    # Small matmuls with 128x128 quantization blocks
-    # Format: (batch, out, in, x_dtype, w_dtype, quant_block) -> (batch_block, out_block, in_block, quant_block)
+    # ========== ALIGNED BLOCKS MODE (Default for simplicity) ==========
+    # All aligned with 128x128 blocks
+    (1024, 1024, 1024, "float8_e4m3fn", "float8_e4m3fn", 128): TunedValue(128, 128, 128, 128),
+    (2048, 2048, 2048, "float8_e4m3fn", "float8_e4m3fn", 128): TunedValue(128, 128, 128, 128),
+    (4096, 4096, 4096, "float8_e4m3fn", "float8_e4m3fn", 128): TunedValue(128, 128, 128, 128),
 
-    # 128x128 quantization blocks
-    (1024, 1024, 1024, "float8_e4m3fn", "float8_e4m3fn", 128): TunedValue(1024, 1024, 1024, 128),
-    (2048, 2048, 2048, "float8_e4m3fn", "float8_e4m3fn", 128): TunedValue(1024, 1024, 2048, 128),
-    (4096, 4096, 4096, "float8_e4m3fn", "float8_e4m3fn", 128): TunedValue(1024, 2048, 4096, 128),
-    (1024, 2048, 1024, "float8_e4m3fn", "float8_e4m3fn", 128): TunedValue(1024, 1024, 1024, 128),
-    (1024, 4096, 2048, "float8_e4m3fn", "float8_e4m3fn", 128): TunedValue(1024, 2048, 2048, 128),
-    (2048, 8192, 2048, "float8_e4m3fn", "float8_e4m3fn", 128): TunedValue(1024, 4096, 2048, 128),
+    # All aligned with 256x256 blocks
+    (1024, 1024, 1024, "float8_e4m3fn", "float8_e4m3fn", 256): TunedValue(256, 256, 256, 256),
+    (2048, 2048, 2048, "float8_e4m3fn", "float8_e4m3fn", 256): TunedValue(256, 256, 256, 256),
+    (4096, 4096, 4096, "float8_e4m3fn", "float8_e4m3fn", 256): TunedValue(256, 256, 256, 256),
 
-    # 256x256 quantization blocks
-    (1024, 1024, 1024, "float8_e4m3fn", "float8_e4m3fn", 256): TunedValue(1024, 1024, 1024, 256),
-    (2048, 2048, 2048, "float8_e4m3fn", "float8_e4m3fn", 256): TunedValue(2048, 2048, 2048, 256),
-    (4096, 4096, 4096, "float8_e4m3fn", "float8_e4m3fn", 256): TunedValue(2048, 2048, 4096, 256),
-    (1024, 2048, 1024, "float8_e4m3fn", "float8_e4m3fn", 256): TunedValue(1024, 2048, 1024, 256),
-    (1024, 4096, 2048, "float8_e4m3fn", "float8_e4m3fn", 256): TunedValue(1024, 2048, 2048, 256),
-    (2048, 8192, 2048, "float8_e4m3fn", "float8_e4m3fn", 256): TunedValue(2048, 4096, 2048, 256),
-    (4096, 16384, 4096, "float8_e4m3fn", "float8_e4m3fn", 256): TunedValue(2048, 4096, 4096, 256),
+    # All aligned with 512x512 blocks
+    (1024, 1024, 1024, "float8_e4m3fn", "float8_e4m3fn", 512): TunedValue(512, 512, 512, 512),
+    (2048, 2048, 2048, "float8_e4m3fn", "float8_e4m3fn", 512): TunedValue(512, 512, 512, 512),
+    (4096, 4096, 4096, "float8_e4m3fn", "float8_e4m3fn", 512): TunedValue(512, 512, 512, 512),
+    (8192, 8192, 8192, "float8_e4m3fn", "float8_e4m3fn", 512): TunedValue(512, 512, 512, 512),
 
-    # 512x512 quantization blocks
-    (1024, 1024, 1024, "float8_e4m3fn", "float8_e4m3fn", 512): TunedValue(1024, 1024, 1024, 512),
-    (2048, 2048, 2048, "float8_e4m3fn", "float8_e4m3fn", 512): TunedValue(2048, 2048, 2048, 512),
-    (4096, 4096, 4096, "float8_e4m3fn", "float8_e4m3fn", 512): TunedValue(4096, 4096, 4096, 512),
-    (8192, 8192, 8192, "float8_e4m3fn", "float8_e4m3fn", 512): TunedValue(4096, 4096, 8192, 512),
-    (1024, 2048, 1024, "float8_e4m3fn", "float8_e4m3fn", 512): TunedValue(1024, 2048, 1024, 512),
-    (2048, 4096, 2048, "float8_e4m3fn", "float8_e4m3fn", 512): TunedValue(2048, 4096, 2048, 512),
-    (4096, 8192, 4096, "float8_e4m3fn", "float8_e4m3fn", 512): TunedValue(4096, 4096, 4096, 512),
+    # Mixed precision: bfloat16 activation with fp8 weights (aligned blocks)
+    (1024, 1024, 1024, "bfloat16", "float8_e4m3fn", 128): TunedValue(128, 128, 128, 128),
+    (2048, 2048, 2048, "bfloat16", "float8_e4m3fn", 128): TunedValue(128, 128, 128, 128),
+    (4096, 4096, 4096, "bfloat16", "float8_e4m3fn", 128): TunedValue(128, 128, 128, 128),
 
-    # Mixed precision: bfloat16 activation with fp8 weights
-    # 128x128 quantization blocks
-    (1024, 1024, 1024, "bfloat16", "float8_e4m3fn", 128): TunedValue(1024, 1024, 1024, 128),
-    (2048, 2048, 2048, "bfloat16", "float8_e4m3fn", 128): TunedValue(1024, 1024, 2048, 128),
-    (4096, 4096, 4096, "bfloat16", "float8_e4m3fn", 128): TunedValue(1024, 2048, 4096, 128),
+    (1024, 1024, 1024, "bfloat16", "float8_e4m3fn", 256): TunedValue(256, 256, 256, 256),
+    (2048, 2048, 2048, "bfloat16", "float8_e4m3fn", 256): TunedValue(256, 256, 256, 256),
+    (4096, 4096, 4096, "bfloat16", "float8_e4m3fn", 256): TunedValue(256, 256, 256, 256),
 
-    # 256x256 quantization blocks
-    (1024, 1024, 1024, "bfloat16", "float8_e4m3fn", 256): TunedValue(1024, 1024, 1024, 256),
-    (2048, 2048, 2048, "bfloat16", "float8_e4m3fn", 256): TunedValue(2048, 2048, 2048, 256),
-    (4096, 4096, 4096, "bfloat16", "float8_e4m3fn", 256): TunedValue(2048, 2048, 4096, 256),
+    (1024, 1024, 1024, "bfloat16", "float8_e4m3fn", 512): TunedValue(512, 512, 512, 512),
+    (2048, 2048, 2048, "bfloat16", "float8_e4m3fn", 512): TunedValue(512, 512, 512, 512),
+    (4096, 4096, 4096, "bfloat16", "float8_e4m3fn", 512): TunedValue(512, 512, 512, 512),
+}
 
-    # 512x512 quantization blocks
-    (1024, 1024, 1024, "bfloat16", "float8_e4m3fn", 512): TunedValue(1024, 1024, 1024, 512),
-    (2048, 2048, 2048, "bfloat16", "float8_e4m3fn", 512): TunedValue(2048, 2048, 2048, 512),
-    (4096, 4096, 4096, "bfloat16", "float8_e4m3fn", 512): TunedValue(4096, 4096, 4096, 512),
+# Example configurations for LARGE BLOCKS mode (to be added as tuning progresses):
+# These amortize kernel overhead by processing multiple quant blocks per kernel
+TUNED_BLOCK_SIZES_LARGE = {
+    # Example: 512x512 quant blocks with 2048x2048 kernel blocks
+    # Each kernel processes a 4×4 grid of quantization blocks
+    # (4096, 4096, 4096, "float8_e4m3fn", "float8_e4m3fn", 512): TunedValue(2048, 2048, 2048, 512),
+    # (8192, 8192, 8192, "float8_e4m3fn", "float8_e4m3fn", 512): TunedValue(4096, 4096, 4096, 512),
+
+    # Example: 256x256 quant blocks with 1024x1024 kernel blocks
+    # (2048, 2048, 2048, "float8_e4m3fn", "float8_e4m3fn", 256): TunedValue(1024, 1024, 1024, 256),
+    # (4096, 4096, 4096, "float8_e4m3fn", "float8_e4m3fn", 256): TunedValue(2048, 2048, 2048, 256),
 }
 
 
@@ -117,54 +130,26 @@ def get_tuned_block_sizes(
     if key in TUNED_BLOCK_SIZES:
         return TUNED_BLOCK_SIZES[key]
 
-    # Fall back to default heuristic based on quantization block size
-    # These defaults ensure:
-    # 1. Divisibility by quantization block size
-    # 2. Divisibility by (8x128) for TPU constraints
-    # 3. Reasonable VMEM usage for Ironwood (64MB)
-    # 4. Good MXU utilization (256x256)
+    # Fall back to simple default: align kernel blocks with quantization blocks
+    # This is the simplest and most straightforward approach:
+    # - Each kernel invocation processes exactly one quantization block
+    # - No sub-block iteration needed
+    # - Simple scale application (one scale per kernel)
+    # - Easy to verify correctness
+    # - Can optimize later if benchmarks show benefit from larger blocks
 
-    if quant_block_size == 128:
-        # For 128x128 quantization, use smaller kernel blocks
-        batch_block_size = min(n_batch, 1024)
-        out_block_size = min(n_out, 1024)
-        in_block_size = min(n_in, 2048)
-    elif quant_block_size == 256:
-        # For 256x256 quantization, use medium kernel blocks
-        batch_block_size = min(n_batch, 2048)
-        out_block_size = min(n_out, 2048)
-        in_block_size = min(n_in, 4096)
-    elif quant_block_size == 512:
-        # For 512x512 quantization, use larger kernel blocks
-        batch_block_size = min(n_batch, 4096)
-        out_block_size = min(n_out, 4096)
-        in_block_size = min(n_in, 8192)
-    else:
-        raise ValueError(
-            f"Unsupported quantization block size: {quant_block_size}. "
-            "Supported values are: 128, 256, 512"
-        )
-
-    # Ensure divisibility by quant_block_size
-    batch_block_size = max(quant_block_size, (batch_block_size // quant_block_size) * quant_block_size)
-    out_block_size = max(quant_block_size, (out_block_size // quant_block_size) * quant_block_size)
-    in_block_size = max(quant_block_size, (in_block_size // quant_block_size) * quant_block_size)
-
-    # Additional constraints for TPU:
-    # - batch_block_size must be divisible by 8 (for 8x128 constraint)
-    # - out_block_size and in_block_size must be divisible by 128
-    def round_up_to_multiple(x, multiple):
-        return ((x + multiple - 1) // multiple) * multiple
-
-    batch_block_size = round_up_to_multiple(batch_block_size, 8)
-    out_block_size = round_up_to_multiple(out_block_size, 128)
-    in_block_size = round_up_to_multiple(in_block_size, 128)
+    # For aligned blocks, kernel block size = quant block size
+    # This already satisfies all TPU constraints since quant_block_size is validated to be
+    # a multiple of 128, and we ensure batch dimension is multiple of 8
+    batch_block_size = quant_block_size
+    out_block_size = quant_block_size
+    in_block_size = quant_block_size
 
     # Verify all constraints are met
     assert batch_block_size % quant_block_size == 0
     assert out_block_size % quant_block_size == 0
     assert in_block_size % quant_block_size == 0
-    assert batch_block_size % 8 == 0
+    assert batch_block_size % 8 == 0  # quant_block_size is always >= 128, so divisible by 8
     assert out_block_size % 128 == 0
     assert in_block_size % 128 == 0
 

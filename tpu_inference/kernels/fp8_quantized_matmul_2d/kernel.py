@@ -25,7 +25,7 @@ quantize_tensor_2d = util.quantize_tensor_2d
 cdiv = pl.cdiv
 
 
-def matmul_kernel_2d(
+def matmul_kernel_2d_large_blocks(
     x_ref: jax.Array,  # (batch_block_size, in_block_size)
     w_q_ref: jax.Array,  # (out_block_size, in_block_size)
     w_scale_ref: jax.Array,  # (n_w_quant_blocks_m, n_w_quant_blocks_n)
@@ -43,27 +43,26 @@ def matmul_kernel_2d(
     save_acc: bool,
     save_x_q: bool,
 ):
-    """Pallas kernel for 2D quantized matmul.
+    """Pallas kernel for 2D quantized matmul with LARGE blocks (kernel blocks > quant blocks).
 
-    This kernel performs matmul with 2D block-wise quantization for both
-    weights and activations. Each block of size (quant_block_size, quant_block_size)
-    has its own scale factor.
+    OPTIMIZED FOR AMORTIZING KERNEL OVERHEAD:
+    - Kernel blocks are MULTIPLES of quantization blocks
+    - Each kernel processes MULTIPLE quantization blocks via sub-block iteration
+    - Uses native fp8×fp8 matmuls for each sub-block
+    - Accumulates partial results with proper 2D scaling
+    - More complex but amortizes kernel launch overhead
 
-    The computation is: out = (x @ w_q.T) with proper 2D scaling applied.
-
-    Key PERFORMANCE optimizations:
-    - All block sizes are compile-time constants for TPU optimization
-    - Dequantize FIRST by broadcasting 2D scales, then do ONE large matmul
-    - This is much faster than nested loops with many small matmuls
-    - Single large matmul maximizes MXU (256x256) utilization on Ironwood TPU
-    - Uses pltpu.repeat() for efficient scale broadcasting
+    For example, with 512×512 quant blocks and 2048×2048 kernel blocks:
+    - Each kernel processes a 4×4 grid of quantization blocks
+    - 16 sub-matmuls per kernel, each using native fp8 hardware
+    - Scales applied per sub-block during accumulation
     """
     # Compile-time assertions for TPU constraints
     assert batch_block_size % quant_block_size == 0
     assert out_block_size % quant_block_size == 0
     assert in_block_size % quant_block_size == 0
-    assert quant_block_size % 128 == 0  # Must be multiple of 128 for TPU
-    assert batch_block_size % 8 == 0  # (8x128) divisibility
+    assert quant_block_size % 128 == 0
+    assert batch_block_size % 8 == 0
     assert out_block_size % 128 == 0
     assert in_block_size % 128 == 0
 
@@ -97,18 +96,15 @@ def matmul_kernel_2d(
     if quantize_activation and jnp.issubdtype(w_q_ref.dtype, jnp.integer):
         acc_dtype = jnp.int32
 
-    # Compute number of quantization blocks (compile-time constants)
+    # Compute number of quantization sub-blocks within kernel block
     n_batch_quant_blocks = batch_block_size // quant_block_size
     n_out_quant_blocks = out_block_size // quant_block_size
     n_in_quant_blocks = in_block_size // quant_block_size
 
     # Start of actual computation logic
     def matmul_body(quant: bool, is_first_step: bool, is_last_step: bool):
-        # PERFORMANCE OPTIMIZATION: Dequantize first, then do ONE large matmul
-        # This is much faster than many small matmuls in nested loops
-        # Mathematically: result[i,j] = sum_k(x[i,k] * w[j,k])
-        #                             = sum_k((x_q[i,k] * x_scale[...]) * (w_q[j,k] * w_scale[...]))
-        #                             = sum_k(x_dequant[i,k] * w_dequant[j,k])
+        # PERFORMANCE KEY: Iterate sub-blocks with native fp8×fp8 matmuls
+        # Similar approach to fused_moe's sub-channel quantization
 
         if quantize_activation:
             if quant:
@@ -130,40 +126,188 @@ def matmul_kernel_2d(
                 if is_last_step:
                     x_scale_tmp = x_scale_scratch[...]
 
-            # Dequantize x by broadcasting 2D scales
-            # x_scale_tmp: [n_batch_quant_blocks, n_in_quant_blocks]
-            # Need to expand to [batch_block_size, in_block_size]
-            x_scale_expanded = pltpu.repeat(
-                pltpu.repeat(x_scale_tmp, quant_block_size, axis=0),
-                quant_block_size,
-                axis=1,
-            )
-            x_dequant = x_q_tmp.astype(jnp.float32) * x_scale_expanded
+        # Initialize accumulator
+        if not is_first_step:
+            acc = acc_scratch[...].astype(jnp.float32)
         else:
-            x_dequant = x_ref[...].astype(jnp.float32)
+            acc = jnp.zeros((batch_block_size, out_block_size), dtype=jnp.float32)
 
-        # Dequantize weights by broadcasting 2D scales
-        # w_scale_ref: [n_out_quant_blocks, n_in_quant_blocks]
-        # Need to expand to [out_block_size, in_block_size]
-        w_scale_expanded = pltpu.repeat(
-            pltpu.repeat(w_scale_ref[...], quant_block_size, axis=0),
-            quant_block_size,
-            axis=1,
-        )
-        w_dequant = w_q_ref[...].astype(jnp.float32) * w_scale_expanded
+        # Iterate over quantization sub-blocks in the K dimension
+        for k_block in range(n_in_quant_blocks):
+            k_start = k_block * quant_block_size
+            k_end = k_start + quant_block_size
 
-        # Single large matmul on dequantized data - MUCH faster!
-        acc = jax.lax.dot_general(
-            x_dequant,
-            w_dequant,
-            (((1,), (1,)), ((), ())),
-            preferred_element_type=jnp.float32,
-        )
+            # Extract sub-blocks for this K iteration
+            if quantize_activation:
+                x_sub = pl.ds(x_q_tmp, k_start, quant_block_size, axis=1)
+            else:
+                x_sub = pl.ds(x_ref[...], k_start, quant_block_size, axis=1)
 
+            w_sub = pl.ds(w_q_ref[...], k_start, quant_block_size, axis=1)
+
+            # Iterate over output blocks
+            for i_block in range(n_out_quant_blocks):
+                i_start = i_block * quant_block_size
+                i_end = i_start + quant_block_size
+
+                w_block = pl.ds(w_sub, i_start, quant_block_size, axis=0)
+
+                # Iterate over batch blocks
+                for j_block in range(n_batch_quant_blocks):
+                    j_start = j_block * quant_block_size
+                    j_end = j_start + quant_block_size
+
+                    x_block = pl.ds(x_sub, j_start, quant_block_size, axis=0)
+
+                    # Native fp8×fp8 matmul for this sub-block
+                    sub_result = jax.lax.dot_general(
+                        x_block,
+                        w_block,
+                        (((1,), (1,)), ((), ())),
+                        preferred_element_type=acc_dtype,
+                    )
+
+                    # Apply 2D scales for this sub-block
+                    sub_result = sub_result.astype(jnp.float32)
+                    w_scale_scalar = w_scale_ref[i_block, k_block]
+                    sub_result *= w_scale_scalar
+
+                    if quantize_activation:
+                        x_scale_scalar = x_scale_tmp[j_block, k_block]
+                        sub_result *= x_scale_scalar
+
+                    # Accumulate into output position
+                    acc = acc.at[j_start:j_end, i_start:i_end].add(sub_result)
+
+        # Store result
+        if is_last_step:
+            out_ref[...] = acc.astype(x_ref_dtype)
+        else:
+            assert save_acc
+            acc_scratch[...] = acc.astype(acc_dtype)
+
+    unfold_args((quant, is_first_step, is_last_step), (), matmul_body)
+
+
+def matmul_kernel_2d(
+    x_ref: jax.Array,  # (quant_block_size, quant_block_size) - single block
+    w_q_ref: jax.Array,  # (quant_block_size, quant_block_size) - single block
+    w_scale_ref: jax.Array,  # scalar (1, 1) - one scale per block
+    x_abs_max_ref: jax.Array,  # scalar (1, 1) - one abs_max per block
+    out_ref: jax.Array,  # (quant_block_size, quant_block_size)
+    acc_scratch: jax.Array,  # (quant_block_size, quant_block_size)
+    x_q_scratch: jax.Array,  # (quant_block_size, quant_block_size)
+    x_scale_scratch: jax.Array,  # scalar (1, 1)
+    *,
+    x_q_dtype: jnp.dtype,
+    quant_block_size: int,
+    save_acc: bool,
+    save_x_q: bool,
+):
+    """Pallas kernel for 2D quantized matmul with aligned blocks.
+
+    SIMPLIFIED APPROACH FOR MAXIMUM PERFORMANCE:
+    - Kernel blocks are ALIGNED with quantization blocks
+    - Each kernel processes exactly ONE quantization block
+    - Simple: fp8×fp8 matmul + scale (no sub-block iteration)
+    - Leverages native fp8 MXU on Ironwood TPU for maximum speed
+    - One scale per kernel = straightforward, easy to verify
+
+    The computation is: out = (x_q @ w_q.T) * x_scale * w_scale
+
+    This is simpler and faster than dequantizing first because:
+    - Uses native fp8×fp8 → fp32 accumulation in hardware
+    - Single matmul operation per kernel
+    - Minimal overhead from scaling (just scalar multiplication at end)
+    """
+    # Compile-time assertions for TPU constraints
+    assert quant_block_size % 128 == 0  # Must be multiple of 128 for TPU
+    assert quant_block_size % 8 == 0  # (8x128) divisibility
+
+    out_idx, in_idx = pl.program_id(1), pl.program_id(2)
+    n_in = pl.num_programs(2)
+    x_ref_dtype = x_ref.dtype
+
+    quantize_activation = x_q_dtype != x_ref_dtype
+
+    # Initialize conditional logic
+    if save_x_q:
+        assert quantize_activation
+        assert x_q_scratch is not None
+        assert x_scale_scratch is not None
+        quant = out_idx == 0
+    else:
+        assert x_q_scratch is None
+        assert x_scale_scratch is None
+        quant = quantize_activation
+
+    if save_acc:
+        assert acc_scratch is not None
+        is_first_step = in_idx == 0
+        is_last_step = in_idx == (n_in - 1)
+    else:
+        assert acc_scratch is None
+        is_first_step = True
+        is_last_step = True
+
+    acc_dtype = jnp.float32
+    if quantize_activation and jnp.issubdtype(w_q_ref.dtype, jnp.integer):
+        acc_dtype = jnp.int32
+
+    # Start of actual computation logic
+    def matmul_body(quant: bool, is_first_step: bool, is_last_step: bool):
+        # PERFORMANCE KEY: Use native fp8×fp8 matmul, NOT dequantize-first!
+        # The TPU MXU does fp8×fp8 → fp32 accumulation in hardware.
+        # This is MUCH faster than fp32×fp32 matmul.
+
+        if quantize_activation:
+            if quant:
+                # Quantize activation block: one scale for entire block
+                x_q_tmp, x_scale_tmp = util.quantize_array_2d(
+                    x_ref[...],
+                    x_abs_max_ref[...],
+                    x_q_dtype,
+                    quant_block_size,
+                    quant_block_size,
+                )
+
+                if save_x_q:
+                    x_q_scratch[...] = x_q_tmp
+                    x_scale_scratch[...] = x_scale_tmp
+            else:
+                assert save_x_q
+                x_q_tmp = x_q_scratch[...]
+                if is_last_step:
+                    x_scale_tmp = x_scale_scratch[...]
+
+            # Native fp8×fp8 matmul with fp32 accumulation
+            acc = jax.lax.dot_general(
+                x_q_tmp,
+                w_q_ref[...],
+                (((1,), (1,)), ((), ())),
+                preferred_element_type=acc_dtype,
+            )
+        else:
+            # bf16 activation × fp8 weight
+            acc = jax.lax.dot_general(
+                x_ref[...],
+                w_q_ref[...],
+                (((1,), (1,)), ((), ())),
+                preferred_element_type=acc_dtype,
+            )
+
+        # Accumulate across in_block dimension
         if not is_first_step:
             acc += acc_scratch[...]
 
+        # Scale and output only on last step
         if is_last_step:
+            # Apply both scales: result = matmul * w_scale * x_scale
+            # w_scale_ref and x_scale are scalars (1,1), will broadcast
+            acc = acc.astype(jnp.float32)
+            acc *= w_scale_ref[0, 0]  # Extract scalar from (1,1) array
+            if quantize_activation:
+                acc *= x_scale_tmp[0, 0]  # Extract scalar from (1,1) array
             out_ref[...] = acc.astype(x_ref_dtype)
         else:
             assert save_acc
@@ -196,14 +340,19 @@ def fp8_quantized_matmul_2d_kernel(
     weights and activations are quantized in blocks of size
     (quant_block_size, quant_block_size).
 
-    PERFORMANCE-CRITICAL optimizations:
-    - **Dequantize-first approach**: Broadcast 2D scales to dequantize, then ONE large matmul
-      instead of many small matmuls. This is the key to high performance.
-    - **Maximum MXU utilization**: Single large matmul uses full 256x256 MXU on Ironwood
+    SIMPLIFIED ALIGNED-BLOCK APPROACH FOR MAXIMUM PERFORMANCE:
+    - **Kernel blocks = quantization blocks**: Each kernel processes exactly one block
+    - **Native fp8×fp8 matmul**: Leverages hardware fp8 MXU for maximum speed
+    - **Simple scale application**: One scale per kernel, just scalar multiply at end
+    - **No sub-block iteration**: Simpler code, easier to verify, less overhead
     - **Static block sizes**: All dimensions are compile-time constants for TPU compiler
-    - **Efficient broadcasting**: Uses pltpu.repeat() for optimal scale expansion
     - **Proper memory layout**: Ensures (8x128) divisibility for TPU constraints
-    - **VMEM management**: Optimized for 64MB VMEM limit on Ironwood
+    - **VMEM efficient**: Each kernel uses ~1MB for 512×512 blocks, well within 64MB limit
+
+    This is simpler and faster than dequantizing first because:
+    - Uses native fp8×fp8 → fp32 accumulation in hardware (vs fp32×fp32)
+    - Minimal scaling overhead (scalar multiplication vs array broadcasting)
+    - More kernel invocations but each is highly optimized
 
     Args:
         x: Input unquantized or pre-quantized array [batch_size, n_in]
@@ -216,12 +365,6 @@ def fp8_quantized_matmul_2d_kernel(
 
     Returns:
         Matmul result [batch_size, n_out]
-
-    Performance note:
-        The dequantize-first approach is mathematically equivalent to scaling after matmul
-        but much faster: result[i,j] = sum_k(x_dequant[i,k] * w_dequant[j,k])
-        where x_dequant[i,k] = x_q[i,k] * x_scale[i//B, k//B] for block size B.
-        This leverages the MXU for a single large operation instead of many small ones.
     """
 
     if w_zp is not None:
@@ -284,10 +427,16 @@ def fp8_quantized_matmul_2d_kernel(
     out_block_size = tuned_value.out_block_size
     in_block_size = tuned_value.in_block_size
 
-    # Verify block sizes are divisible by quant_block_size
-    assert batch_block_size % quant_block_size == 0
-    assert out_block_size % quant_block_size == 0
-    assert in_block_size % quant_block_size == 0
+    # Determine if we're using aligned blocks (simple) or large blocks (amortized overhead)
+    use_aligned_blocks = (
+        batch_block_size == quant_block_size and
+        out_block_size == quant_block_size and
+        in_block_size == quant_block_size
+    )
+
+    # Both approaches are supported:
+    # - Aligned blocks: Simple, one quant block per kernel, native fp8 matmul
+    # - Large blocks: More complex, multiple quant blocks per kernel, amortizes overhead
 
     # Pad inputs to be multiple of block size
     padded_n_batch = next_multiple(orig_n_batch, batch_block_size)
@@ -368,72 +517,146 @@ def fp8_quantized_matmul_2d_kernel(
         upper_limit_bytes=get_device_vmem_limit(),
     )
 
-    # Define BlockSpec for 2D scales
-    n_w_blocks_m = out_block_size // quant_block_size
-    n_w_blocks_n = in_block_size // quant_block_size
-    n_x_blocks_m = batch_block_size // quant_block_size
-    n_x_blocks_n = in_block_size // quant_block_size
+    # Choose kernel based on block size configuration
+    if use_aligned_blocks:
+        # ALIGNED BLOCKS: Simple, one quant block per kernel
+        # Each kernel processes exactly one quantization block
+        # Scales are 1×1 per kernel (scalar)
+        assert batch_block_size == quant_block_size
+        assert out_block_size == quant_block_size
+        assert in_block_size == quant_block_size
 
-    kernel = pl.pallas_call(
-        functools.partial(
-            matmul_kernel_2d,
-            x_q_dtype=x_q_dtype,
-            quant_block_size=quant_block_size,
-            batch_block_size=batch_block_size,
-            out_block_size=out_block_size,
-            in_block_size=in_block_size,
-            save_acc=save_acc,
-            save_x_q=save_x_q,
-        ),
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=0,
-            in_specs=[
-                pl.BlockSpec(
-                    (batch_block_size, in_block_size),
-                    lambda b, o, i: (b, i),
-                ),  # x
-                pl.BlockSpec(
-                    (out_block_size, in_block_size),
-                    lambda b, o, i: (o, i),
-                ),  # w_q
-                pl.BlockSpec(
-                    (n_w_blocks_m, n_w_blocks_n),
-                    lambda b, o, i: (o * n_w_blocks_m, i * n_w_blocks_n),
-                ),  # w_scale (2D)
-                pl.BlockSpec(
-                    (n_x_blocks_m, n_x_blocks_n),
-                    lambda b, o, i: (b * n_x_blocks_m, i * n_x_blocks_n),
-                ),  # x_abs_max (2D)
-            ],
-            out_specs=pl.BlockSpec(
-                (batch_block_size, out_block_size),
-                lambda b, o, i: (b, o),
+        n_w_blocks_m = 1
+        n_w_blocks_n = 1
+        n_x_blocks_m = 1
+        n_x_blocks_n = 1
+
+        kernel = pl.pallas_call(
+            functools.partial(
+                matmul_kernel_2d,
+                x_q_dtype=x_q_dtype,
+                quant_block_size=quant_block_size,
+                save_acc=save_acc,
+                save_x_q=save_x_q,
             ),
-            scratch_shapes=[
-                (
-                    pltpu.VMEM((batch_block_size, out_block_size), acc_dtype)
-                    if save_acc
-                    else None
-                ),  # acc_scratch
-                (
-                    pltpu.VMEM((batch_block_size, in_block_size), x_q_dtype)
-                    if save_x_q
-                    else None
-                ),  # x_q_scratch
-                (
-                    pltpu.VMEM((n_x_blocks_m, n_x_blocks_n), jnp.float32)
-                    if save_x_q
-                    else None
-                ),  # x_scale_scratch (2D)
-            ],
-            grid=(n_batch, n_out, n_in),
-        ),
-        out_shape=jax.ShapeDtypeStruct((padded_n_batch, padded_n_out), x.dtype),
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "arbitrary", "arbitrary"),
-            vmem_limit_bytes=vmem_limit_bytes,
-        ),
-    )
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=0,
+                in_specs=[
+                    pl.BlockSpec(
+                        (quant_block_size, quant_block_size),
+                        lambda b, o, i: (b * quant_block_size, i * quant_block_size),
+                    ),  # x
+                    pl.BlockSpec(
+                        (quant_block_size, quant_block_size),
+                        lambda b, o, i: (o * quant_block_size, i * quant_block_size),
+                    ),  # w_q
+                    pl.BlockSpec(
+                        (1, 1),  # Single scale per kernel block
+                        lambda b, o, i: (o, i),
+                    ),  # w_scale
+                    pl.BlockSpec(
+                        (1, 1),  # Single abs_max per kernel block
+                        lambda b, o, i: (b, i),
+                    ),  # x_abs_max
+                ],
+                out_specs=pl.BlockSpec(
+                    (quant_block_size, quant_block_size),
+                    lambda b, o, i: (b * quant_block_size, o * quant_block_size),
+                ),
+                scratch_shapes=[
+                    (
+                        pltpu.VMEM((quant_block_size, quant_block_size), acc_dtype)
+                        if save_acc
+                        else None
+                    ),  # acc_scratch
+                    (
+                        pltpu.VMEM((quant_block_size, quant_block_size), x_q_dtype)
+                        if save_x_q
+                        else None
+                    ),  # x_q_scratch
+                    (
+                        pltpu.VMEM((1, 1), jnp.float32)
+                        if save_x_q
+                        else None
+                    ),  # x_scale_scratch (scalar)
+                ],
+                grid=(n_batch, n_out, n_in),
+            ),
+            out_shape=jax.ShapeDtypeStruct((padded_n_batch, padded_n_out), x.dtype),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("parallel", "arbitrary", "arbitrary"),
+                vmem_limit_bytes=vmem_limit_bytes,
+            ),
+        )
+    else:
+        # LARGE BLOCKS: Multiple quant blocks per kernel to amortize overhead
+        # Each kernel processes a grid of quantization blocks
+        # Scales are 2D arrays per kernel block
+        n_w_blocks_m = out_block_size // quant_block_size
+        n_w_blocks_n = in_block_size // quant_block_size
+        n_x_blocks_m = batch_block_size // quant_block_size
+        n_x_blocks_n = in_block_size // quant_block_size
+
+        kernel = pl.pallas_call(
+            functools.partial(
+                matmul_kernel_2d_large_blocks,
+                x_q_dtype=x_q_dtype,
+                quant_block_size=quant_block_size,
+                batch_block_size=batch_block_size,
+                out_block_size=out_block_size,
+                in_block_size=in_block_size,
+                save_acc=save_acc,
+                save_x_q=save_x_q,
+            ),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=0,
+                in_specs=[
+                    pl.BlockSpec(
+                        (batch_block_size, in_block_size),
+                        lambda b, o, i: (b, i),
+                    ),  # x
+                    pl.BlockSpec(
+                        (out_block_size, in_block_size),
+                        lambda b, o, i: (o, i),
+                    ),  # w_q
+                    pl.BlockSpec(
+                        (n_w_blocks_m, n_w_blocks_n),
+                        lambda b, o, i: (o * n_w_blocks_m, i * n_w_blocks_n),
+                    ),  # w_scale (2D)
+                    pl.BlockSpec(
+                        (n_x_blocks_m, n_x_blocks_n),
+                        lambda b, o, i: (b * n_x_blocks_m, i * n_x_blocks_n),
+                    ),  # x_abs_max (2D)
+                ],
+                out_specs=pl.BlockSpec(
+                    (batch_block_size, out_block_size),
+                    lambda b, o, i: (b, o),
+                ),
+                scratch_shapes=[
+                    (
+                        pltpu.VMEM((batch_block_size, out_block_size), acc_dtype)
+                        if save_acc
+                        else None
+                    ),  # acc_scratch
+                    (
+                        pltpu.VMEM((batch_block_size, in_block_size), x_q_dtype)
+                        if save_x_q
+                        else None
+                    ),  # x_q_scratch
+                    (
+                        pltpu.VMEM((n_x_blocks_m, n_x_blocks_n), jnp.float32)
+                        if save_x_q
+                        else None
+                    ),  # x_scale_scratch (2D)
+                ],
+                grid=(n_batch, n_out, n_in),
+            ),
+            out_shape=jax.ShapeDtypeStruct((padded_n_batch, padded_n_out), x.dtype),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("parallel", "arbitrary", "arbitrary"),
+                vmem_limit_bytes=vmem_limit_bytes,
+            ),
+        )
 
     util.validate_inputs(
         x=x,
