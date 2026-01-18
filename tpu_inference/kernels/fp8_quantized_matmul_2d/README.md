@@ -1,6 +1,16 @@
 # 2D FP8 Quantized Matmul Kernel for Ironwood TPU
 
-This kernel implements high-performance matrix multiplication with 2D block-wise quantization for Ironwood TPU (64MB VMEM, 256×256 MXU with native fp8 support).
+This module provides **three versions** of high-performance matrix multiplication kernels with 2D block-wise quantization for Ironwood TPU (64MB VMEM, 256×256 MXU with native fp8 support).
+
+## Available Versions
+
+| Version | Approach | Complexity | Best For |
+|---------|----------|------------|----------|
+| **v1** | Auto double buffering | ⭐ Simple | Baseline, most cases |
+| **v2** | Manual async DMA + semaphores | ⭐⭐⭐ Complex | Fine-grained control |
+| **v3** | SMEM for scales + async DMA | ⭐⭐⭐⭐ Very Complex | Maximum performance (aligned blocks) |
+
+See [VERSION_COMPARISON.md](VERSION_COMPARISON.md) for detailed comparison and benchmarking guide.
 
 ## Key Features
 
