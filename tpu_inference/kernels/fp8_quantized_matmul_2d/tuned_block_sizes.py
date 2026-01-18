@@ -119,9 +119,10 @@ def get_tuned_block_sizes(
 
     # Fall back to default heuristic based on quantization block size
     # These defaults ensure:
-    # 1. Divisibility by (8x128) for last two dimensions
-    # 2. Reasonable VMEM usage for Ironwood (64MB)
-    # 3. Good MXU utilization (256x256)
+    # 1. Divisibility by quantization block size
+    # 2. Divisibility by (8x128) for TPU constraints
+    # 3. Reasonable VMEM usage for Ironwood (64MB)
+    # 4. Good MXU utilization (256x256)
 
     if quant_block_size == 128:
         # For 128x128 quantization, use smaller kernel blocks
@@ -148,6 +149,24 @@ def get_tuned_block_sizes(
     batch_block_size = max(quant_block_size, (batch_block_size // quant_block_size) * quant_block_size)
     out_block_size = max(quant_block_size, (out_block_size // quant_block_size) * quant_block_size)
     in_block_size = max(quant_block_size, (in_block_size // quant_block_size) * quant_block_size)
+
+    # Additional constraints for TPU:
+    # - batch_block_size must be divisible by 8 (for 8x128 constraint)
+    # - out_block_size and in_block_size must be divisible by 128
+    def round_up_to_multiple(x, multiple):
+        return ((x + multiple - 1) // multiple) * multiple
+
+    batch_block_size = round_up_to_multiple(batch_block_size, 8)
+    out_block_size = round_up_to_multiple(out_block_size, 128)
+    in_block_size = round_up_to_multiple(in_block_size, 128)
+
+    # Verify all constraints are met
+    assert batch_block_size % quant_block_size == 0
+    assert out_block_size % quant_block_size == 0
+    assert in_block_size % quant_block_size == 0
+    assert batch_block_size % 8 == 0
+    assert out_block_size % 128 == 0
+    assert in_block_size % 128 == 0
 
     return TunedValue(
         batch_block_size=batch_block_size,

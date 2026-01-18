@@ -5,6 +5,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -21,20 +22,24 @@ from tpu_inference.kernels.fp8_quantized_matmul_2d.util import (
 )
 
 quantize_tensor_2d = util.quantize_tensor_2d
+cdiv = pl.cdiv
 
 
 def matmul_kernel_2d(
     x_ref: jax.Array,  # (batch_block_size, in_block_size)
     w_q_ref: jax.Array,  # (out_block_size, in_block_size)
-    w_scale_ref: jax.Array,  # (n_w_blocks_m, n_w_blocks_n)
-    x_abs_max_ref: jax.Array,  # (n_x_blocks_m, n_x_blocks_n)
+    w_scale_ref: jax.Array,  # (n_w_quant_blocks_m, n_w_quant_blocks_n)
+    x_abs_max_ref: jax.Array,  # (n_x_quant_blocks_m, n_x_quant_blocks_n)
     out_ref: jax.Array,  # (batch_block_size, out_block_size)
     acc_scratch: jax.Array,  # (batch_block_size, out_block_size)
     x_q_scratch: jax.Array,  # (batch_block_size, in_block_size)
-    x_scale_scratch: jax.Array,  # (n_x_blocks_m, n_x_blocks_n)
+    x_scale_scratch: jax.Array,  # (n_x_quant_blocks_m, n_x_quant_blocks_n)
     *,
     x_q_dtype: jnp.dtype,
     quant_block_size: int,
+    batch_block_size: int,
+    out_block_size: int,
+    in_block_size: int,
     save_acc: bool,
     save_x_q: bool,
 ):
@@ -44,8 +49,22 @@ def matmul_kernel_2d(
     weights and activations. Each block of size (quant_block_size, quant_block_size)
     has its own scale factor.
 
-    The computation is: out = (x @ w_q.T) with proper scaling applied.
+    The computation is: out = (x @ w_q.T) with proper 2D scaling applied.
+
+    Key implementation details:
+    - All block sizes are compile-time constants for TPU optimization
+    - Uses sub-block iteration pattern similar to fused_moe for 2D scaling
+    - Scales are applied after matmul to keep data in quantized format for MXU
     """
+    # Compile-time assertions for TPU constraints
+    assert batch_block_size % quant_block_size == 0
+    assert out_block_size % quant_block_size == 0
+    assert in_block_size % quant_block_size == 0
+    assert quant_block_size % 128 == 0  # Must be multiple of 128 for TPU
+    assert batch_block_size % 8 == 0  # (8x128) divisibility
+    assert out_block_size % 128 == 0
+    assert in_block_size % 128 == 0
+
     out_idx, in_idx = pl.program_id(1), pl.program_id(2)
     n_in = pl.num_programs(2)
     x_ref_dtype = x_ref.dtype
@@ -76,11 +95,17 @@ def matmul_kernel_2d(
     if quantize_activation and jnp.issubdtype(w_q_ref.dtype, jnp.integer):
         acc_dtype = jnp.int32
 
-    batch_block_size, in_block_size = x_ref.shape
-    out_block_size = w_q_ref.shape[0]
+    # Compute number of quantization blocks (compile-time constants)
+    n_batch_quant_blocks = batch_block_size // quant_block_size
+    n_out_quant_blocks = out_block_size // quant_block_size
+    n_in_quant_blocks = in_block_size // quant_block_size
 
     # Start of actual computation logic
     def matmul_body(quant: bool, is_first_step: bool, is_last_step: bool):
+        # For 2D block quantization, we need to break down the matmul into sub-blocks
+        # and apply different scales to each sub-block contribution.
+        # This follows the pattern from fused_moe kernel (lines 813-890)
+
         if quantize_activation:
             if quant:
                 # Quantize activation with 2D blocks
@@ -95,124 +120,64 @@ def matmul_kernel_2d(
                 if save_x_q:
                     x_q_scratch[...] = x_q_tmp
                     x_scale_scratch[...] = x_scale_tmp
-
             else:
                 assert save_x_q
                 x_q_tmp = x_q_scratch[...]
                 if is_last_step:
                     x_scale_tmp = x_scale_scratch[...]
 
-            # Perform quantized matmul
-            # x_q_tmp: [batch_block_size, in_block_size]
-            # w_q_ref: [out_block_size, in_block_size]
-            # Result: [batch_block_size, out_block_size]
-            acc = jax.lax.dot_general(
-                x_q_tmp,
-                w_q_ref[...],
-                (((1,), (1,)), ((), ())),
-                preferred_element_type=acc_dtype,
-            )
+            x_input = x_q_tmp
         else:
-            # No activation quantization
-            acc = jax.lax.dot_general(
-                x_ref[...],
-                w_q_ref[...],
-                (((1,), (1,)), ((), ())),
-                preferred_element_type=acc_dtype,
-            )
+            x_input = x_ref[...]
+            x_scale_tmp = None
 
-        if not is_first_step:
-            acc += acc_scratch[...]
+        # Initialize or load accumulator
+        if is_first_step:
+            acc = jnp.zeros((batch_block_size, out_block_size), dtype=jnp.float32)
+        else:
+            acc = acc_scratch[...].astype(jnp.float32)
+
+        # Perform blocked matmul with per-block scaling
+        # Iterate over quantization blocks in all three dimensions
+        for batch_qblock_id in range(n_batch_quant_blocks):
+            for out_qblock_id in range(n_out_quant_blocks):
+                # Initialize accumulator for this output block
+                partial_acc = jnp.zeros((quant_block_size, quant_block_size), dtype=jnp.float32)
+
+                # Accumulate contributions from all input quantization blocks
+                for in_qblock_id in range(n_in_quant_blocks):
+                    # Extract quantization blocks
+                    x_block = x_input[
+                        pl.ds(batch_qblock_id * quant_block_size, quant_block_size),
+                        pl.ds(in_qblock_id * quant_block_size, quant_block_size),
+                    ]
+                    w_block = w_q_ref[
+                        pl.ds(out_qblock_id * quant_block_size, quant_block_size),
+                        pl.ds(in_qblock_id * quant_block_size, quant_block_size),
+                    ]
+
+                    # Compute sub-block matmul
+                    sub_result = jnp.dot(x_block, w_block.T, preferred_element_type=acc_dtype).astype(jnp.float32)
+
+                    # Apply 2D block-wise scales
+                    w_scale_val = w_scale_ref[out_qblock_id, in_qblock_id]
+                    if quantize_activation:
+                        x_scale_val = x_scale_tmp[batch_qblock_id, in_qblock_id]
+                        combined_scale = x_scale_val * w_scale_val
+                    else:
+                        combined_scale = w_scale_val
+
+                    sub_result *= combined_scale
+                    partial_acc += sub_result
+
+                # Write back the accumulated result for this output block
+                acc = acc.at[
+                    pl.ds(batch_qblock_id * quant_block_size, quant_block_size),
+                    pl.ds(out_qblock_id * quant_block_size, quant_block_size),
+                ].set(partial_acc)
 
         if is_last_step:
-            # Apply 2D block-wise scaling
-            # For 2D quantization, we need to apply scaling for each block combination
-
-            # Convert to float32 for scaling
-            acc = acc.astype(jnp.float32)
-
-            # Get block indices
-            n_x_blocks_m = batch_block_size // quant_block_size
-            n_x_blocks_n = in_block_size // quant_block_size
-            n_w_blocks_m = out_block_size // quant_block_size
-            n_w_blocks_n = in_block_size // quant_block_size
-
-            # Reshape accumulator to expose blocks
-            # [batch_block_size, out_block_size] -> [n_x_blocks_m, quant_block_size, n_w_blocks_m, quant_block_size]
-            acc_reshaped = acc.reshape(
-                n_x_blocks_m,
-                quant_block_size,
-                n_w_blocks_m,
-                quant_block_size,
-            )
-
-            # For each output block, we need to sum contributions from all input blocks
-            # and apply the corresponding weight scale
-            # Weight scale shape: [n_w_blocks_m, n_w_blocks_n]
-            # We need to reduce over n_w_blocks_n (which corresponds to in_block_size)
-
-            # Since we're iterating over input blocks (in_idx), we need to accumulate
-            # scaled results. The weight scale for this iteration depends on in_idx.
-
-            # For this input block slice, get the corresponding weight scales
-            # w_scale_ref shape: [n_w_blocks_m, n_w_blocks_n]
-            # We need the scales for all output blocks and this specific input block range
-
-            # Apply weight scaling
-            # For each output block, apply its corresponding scale
-            # Since we process one input block at a time in this kernel grid,
-            # we need to apply scaling differently
-
-            # Actually, let me reconsider: in the 2D quantization case,
-            # the matmul result for a single (batch_block, out_block, in_block) iteration
-            # contains contributions from multiple quantization blocks.
-
-            # The proper way to handle this is to dequantize before the matmul.
-            # Let me restructure this.
-
-            # For 2D block quantization, we need to dequantify blocks and then matmul
-            # This is more complex in Pallas. For now, let's apply a simplified
-            # per-block scaling approach.
-
-            # Apply weight scale
-            # Expand weight scale to match accumulator shape
-            # w_scale_ref: [n_w_blocks_m, n_w_blocks_n]
-            # We sum over input blocks, so we need to handle scaling carefully
-
-            # For simplicity in this initial implementation, we'll apply an average
-            # scaling based on the weight scales for this input block range
-
-            # Get the slice of weight scales for this input block
-            # Since in_idx determines which input block we're processing,
-            # we need to map it to quantization blocks
-            # This is getting complex - let me use a simpler approach for the first version
-
-            # Apply weight scaling by broadcasting
-            # w_scale_ref: [n_w_blocks_m, n_w_blocks_n]
-            # For each output block (n_w_blocks_m), we average the scales across input blocks
-            w_scale_avg = jnp.mean(w_scale_ref[...], axis=1, keepdims=True)  # [n_w_blocks_m, 1]
-
-            # Reshape to broadcast: [1, 1, n_w_blocks_m, 1]
-            w_scale_broadcast = w_scale_avg[jnp.newaxis, jnp.newaxis, :, jnp.newaxis]
-
-            # Apply to reshaped accumulator
-            acc_scaled = acc_reshaped * w_scale_broadcast
-
-            if quantize_activation:
-                # Apply activation scaling
-                # x_scale_tmp: [n_x_blocks_m, n_x_blocks_n]
-                # Average across input dimension
-                x_scale_avg = jnp.mean(x_scale_tmp, axis=1, keepdims=True)  # [n_x_blocks_m, 1]
-
-                # Reshape to broadcast: [n_x_blocks_m, 1, 1, 1]
-                x_scale_broadcast = x_scale_avg[:, jnp.newaxis, jnp.newaxis, :]
-
-                acc_scaled = acc_scaled * x_scale_broadcast
-
-            # Reshape back to original shape
-            acc_scaled = acc_scaled.reshape(batch_block_size, out_block_size)
-
-            out_ref[...] = acc_scaled.astype(x_ref_dtype)
+            out_ref[...] = acc.astype(x_ref_dtype)
         else:
             assert save_acc
             acc_scratch[...] = acc
@@ -244,6 +209,13 @@ def fp8_quantized_matmul_2d_kernel(
     weights and activations are quantized in blocks of size
     (quant_block_size, quant_block_size).
 
+    Performance optimizations:
+    - All block sizes are compile-time constants for TPU optimization
+    - Sub-block iteration pattern (similar to fused_moe) for correct 2D scaling
+    - Scales applied after each sub-matmul before accumulation
+    - Ensures (8x128) divisibility for Ironwood TPU MXU constraints
+    - VMEM management for 64MB limit with proper double buffering
+
     Args:
         x: Input unquantized or pre-quantized array [batch_size, n_in]
         w_q: Weight quantized array [n_out, n_in] in fp8 format
@@ -255,6 +227,12 @@ def fp8_quantized_matmul_2d_kernel(
 
     Returns:
         Matmul result [batch_size, n_out]
+
+    Note:
+        For 2D quantization to work correctly, the matmul is broken down into sub-blocks.
+        Each sub-block contribution is scaled individually before accumulation, following
+        the pattern: result += scale[i,k] * scale[j,k] * (x_block[i,k] @ w_block[j,k].T)
+        This ensures each quantization block's scale is properly applied.
     """
 
     if w_zp is not None:
@@ -412,6 +390,9 @@ def fp8_quantized_matmul_2d_kernel(
             matmul_kernel_2d,
             x_q_dtype=x_q_dtype,
             quant_block_size=quant_block_size,
+            batch_block_size=batch_block_size,
+            out_block_size=out_block_size,
+            in_block_size=in_block_size,
             save_acc=save_acc,
             save_x_q=save_x_q,
         ),
