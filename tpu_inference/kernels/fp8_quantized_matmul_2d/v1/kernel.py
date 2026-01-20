@@ -9,13 +9,13 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from tpu_inference.kernels.fp8_quantized_matmul_2d import util
-from tpu_inference.kernels.fp8_quantized_matmul_2d.tuned_block_sizes import (
+from tpu_inference.kernels.fp8_quantized_matmul_2d.v1 import util
+from tpu_inference.kernels.fp8_quantized_matmul_2d.v1.tuned_block_sizes import (
     TunedValue,
     get_device_vmem_limit,
     get_tuned_block_sizes,
 )
-from tpu_inference.kernels.fp8_quantized_matmul_2d.util import (
+from tpu_inference.kernels.fp8_quantized_matmul_2d.v1.util import (
     get_kernel_name,
     next_multiple,
     unfold_args,

@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 from jax._src import dtypes
 
-from tpu_inference.kernels.fp8_quantized_matmul_2d.tuned_block_sizes import TunedValue
+from tpu_inference.kernels.fp8_quantized_matmul_2d.v2.tuned_block_sizes import TunedValue
 
 
 def unfold_args(
