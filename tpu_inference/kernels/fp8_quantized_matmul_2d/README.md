@@ -230,13 +230,65 @@ For 4096×4096 matrices with 512×512 quantization blocks:
 - Each kernel: 64 sub-matmuls (4×4×4)
 - Potentially 2-4× faster due to amortization (needs benchmarking)
 
-## Testing
+## Testing and Benchmarking
 
-See `tests/kernels/fp8_quantized_matmul_2d_kernel_test.py` for comprehensive tests covering:
+### Correctness Testing
+
+**CRITICAL: Always test correctness before benchmarking!**
+
+```bash
+# Test all three versions against reference implementation
+python scripts/test_kernel_correctness.py
+```
+
+This tests all versions (v1, v2, v3) on multiple problem sizes and verifies numerical correctness. All tests must pass before proceeding to benchmarking.
+
+### Performance Benchmarking
+
+```bash
+# Full benchmark suite (compares all versions)
+python scripts/benchmark_kernels.py
+
+# Quick test (fewer iterations)
+python scripts/benchmark_kernels.py --quick
+```
+
+This benchmarks all three versions and identifies the fastest implementation for your workload. See `scripts/README_TESTING.md` for detailed documentation.
+
+### HLO Verification
+
+```bash
+# Quick HLO inspection (verifies optimizations are working)
+./scripts/quick_hlo_check.sh
+
+# Verify v2/v3 bug fixes
+./scripts/verify_bugfixes.sh
+```
+
+These tools verify that manual optimizations (async DMA, SMEM) are actually present in the compiled HLO output.
+
+### Unit Tests
+
+See `tests/kernels/fp8_quantized_matmul_2d_kernel_test.py` for comprehensive unit tests covering:
 - Various matrix sizes
 - Different quantization block sizes (128, 256, 512)
 - Both quantize activation modes
 - Correctness vs reference implementation
+
+### Recommended Testing Workflow
+
+```bash
+# 1. Verify HLO patterns (optional, for debugging)
+./scripts/quick_hlo_check.sh
+
+# 2. Test correctness (REQUIRED before benchmarking)
+python scripts/test_kernel_correctness.py
+
+# 3. Benchmark performance (choose best version)
+python scripts/benchmark_kernels.py
+```
+
+See `scripts/README_TESTING.md` for complete testing documentation.
 
 ## References
 
