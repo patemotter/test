@@ -18,6 +18,7 @@ from tpu_inference.kernels.fp8_quantized_matmul_2d.v1.tuned_block_sizes import (
 from tpu_inference.kernels.fp8_quantized_matmul_2d.v1.util import (
     get_kernel_name,
     next_multiple,
+    unfold_args,
 )
 
 quantize_tensor_2d = util.quantize_tensor_2d
@@ -101,98 +102,91 @@ def matmul_kernel_2d_large_blocks(
     n_in_quant_blocks = in_block_size // quant_block_size
 
     # Start of actual computation logic
-    # PERFORMANCE KEY: Iterate sub-blocks with native fp8×fp8 matmuls
-    # Similar approach to fused_moe's sub-channel quantization
+    def matmul_body(quant: bool, is_first_step: bool, is_last_step: bool):
+        # PERFORMANCE KEY: Iterate sub-blocks with native fp8×fp8 matmuls
+        # Similar approach to fused_moe's sub-channel quantization
 
-    if quantize_activation:
-        # Quantize or reuse - use jax.lax.cond for potentially-traced quant
-        def quantize_branch():
-            x_q, x_scale = util.quantize_array_2d(
-                x_ref[...],
-                x_abs_max_ref[...],
-                x_q_dtype,
-                quant_block_size,
-                quant_block_size,
-            )
-            if save_x_q:
-                x_q_scratch[...] = x_q
-                x_scale_scratch[...] = x_scale
-            return x_q, x_scale
-
-        def reuse_branch():
-            x_q = x_q_scratch[...]
-            # Use jax.lax.cond for conditional scale loading
-            x_scale = jax.lax.cond(
-                is_last_step,
-                lambda: x_scale_scratch[...],
-                lambda: jnp.zeros((n_batch_quant_blocks, n_in_quant_blocks), dtype=jnp.float32),
-            )
-            return x_q, x_scale
-
-        x_q_tmp, x_scale_tmp = jax.lax.cond(quant, quantize_branch, reuse_branch)
-
-    # Initialize accumulator - use jax.lax.select
-    acc = jax.lax.select(
-        is_first_step,
-        jnp.zeros((batch_block_size, out_block_size), dtype=jnp.float32),
-        acc_scratch[...].astype(jnp.float32)
-    )
-
-    # Iterate over quantization sub-blocks in the K dimension
-    for k_block in range(n_in_quant_blocks):
-        k_start = k_block * quant_block_size
-        k_end = k_start + quant_block_size
-
-        # Extract sub-blocks for this K iteration
         if quantize_activation:
-            x_sub = pl.ds(x_q_tmp, k_start, quant_block_size, axis=1)
-        else:
-            x_sub = pl.ds(x_ref[...], k_start, quant_block_size, axis=1)
-
-        w_sub = pl.ds(w_q_ref[...], k_start, quant_block_size, axis=1)
-
-        # Iterate over output blocks
-        for i_block in range(n_out_quant_blocks):
-            i_start = i_block * quant_block_size
-            i_end = i_start + quant_block_size
-
-            w_block = pl.ds(w_sub, i_start, quant_block_size, axis=0)
-
-            # Iterate over batch blocks
-            for j_block in range(n_batch_quant_blocks):
-                j_start = j_block * quant_block_size
-                j_end = j_start + quant_block_size
-
-                x_block = pl.ds(x_sub, j_start, quant_block_size, axis=0)
-
-                # Native fp8×fp8 matmul for this sub-block
-                sub_result = jax.lax.dot_general(
-                    x_block,
-                    w_block,
-                    (((1,), (1,)), ((), ())),
-                    preferred_element_type=acc_dtype,
+            if quant:
+                x_q_tmp, x_scale_tmp = util.quantize_array_2d(
+                    x_ref[...],
+                    x_abs_max_ref[...],
+                    x_q_dtype,
+                    quant_block_size,
+                    quant_block_size,
                 )
 
-                # Apply 2D scales for this sub-block
-                sub_result = sub_result.astype(jnp.float32)
-                w_scale_scalar = w_scale_ref[i_block, k_block]
-                sub_result *= w_scale_scalar
+                if save_x_q:
+                    x_q_scratch[...] = x_q_tmp
+                    x_scale_scratch[...] = x_scale_tmp
 
-                if quantize_activation:
-                    x_scale_scalar = x_scale_tmp[j_block, k_block]
-                    sub_result *= x_scale_scalar
+            else:
+                assert save_x_q
+                x_q_tmp = x_q_scratch[...]
+                # Always load scale - needed for sub-block scaling in the loop
+                x_scale_tmp = x_scale_scratch[...]
 
-                # Accumulate into output position
-                acc = acc.at[j_start:j_end, i_start:i_end].add(sub_result)
+        # Initialize accumulator
+        if is_first_step:
+            acc = jnp.zeros((batch_block_size, out_block_size), dtype=jnp.float32)
+        else:
+            acc = acc_scratch[...].astype(jnp.float32)
 
-    # Store result - use jax.lax.cond for is_last_step
-    def output_branch():
-        out_ref[...] = acc.astype(x_ref_dtype)
+        # Iterate over quantization sub-blocks in the K dimension
+        for k_block in range(n_in_quant_blocks):
+            k_start = k_block * quant_block_size
+            k_end = k_start + quant_block_size
 
-    def save_branch():
-        acc_scratch[...] = acc.astype(acc_dtype)
+            # Extract sub-blocks for this K iteration
+            if quantize_activation:
+                x_sub = pl.ds(x_q_tmp, k_start, quant_block_size, axis=1)
+            else:
+                x_sub = pl.ds(x_ref[...], k_start, quant_block_size, axis=1)
 
-    jax.lax.cond(is_last_step, output_branch, save_branch)
+            w_sub = pl.ds(w_q_ref[...], k_start, quant_block_size, axis=1)
+
+            # Iterate over output blocks
+            for i_block in range(n_out_quant_blocks):
+                i_start = i_block * quant_block_size
+                i_end = i_start + quant_block_size
+
+                w_block = pl.ds(w_sub, i_start, quant_block_size, axis=0)
+
+                # Iterate over batch blocks
+                for j_block in range(n_batch_quant_blocks):
+                    j_start = j_block * quant_block_size
+                    j_end = j_start + quant_block_size
+
+                    x_block = pl.ds(x_sub, j_start, quant_block_size, axis=0)
+
+                    # Native fp8×fp8 matmul for this sub-block
+                    sub_result = jax.lax.dot_general(
+                        x_block,
+                        w_block,
+                        (((1,), (1,)), ((), ())),
+                        preferred_element_type=acc_dtype,
+                    )
+
+                    # Apply 2D scales for this sub-block
+                    sub_result = sub_result.astype(jnp.float32)
+                    w_scale_scalar = w_scale_ref[i_block, k_block]
+                    sub_result *= w_scale_scalar
+
+                    if quantize_activation:
+                        x_scale_scalar = x_scale_tmp[j_block, k_block]
+                        sub_result *= x_scale_scalar
+
+                    # Accumulate into output position
+                    acc = acc.at[j_start:j_end, i_start:i_end].add(sub_result)
+
+        # Store result
+        if is_last_step:
+            out_ref[...] = acc.astype(x_ref_dtype)
+        else:
+            assert save_acc
+            acc_scratch[...] = acc.astype(acc_dtype)
+
+    unfold_args((quant, is_first_step, is_last_step), (), matmul_body)
 
 
 def matmul_kernel_2d(
@@ -261,71 +255,64 @@ def matmul_kernel_2d(
         acc_dtype = jnp.int32
 
     # Start of actual computation logic
-    # PERFORMANCE KEY: Use native fp8×fp8 matmul, NOT dequantize-first!
-    # The TPU MXU does fp8×fp8 → fp32 accumulation in hardware.
-    # This is MUCH faster than fp32×fp32 matmul.
+    def matmul_body(quant: bool, is_first_step: bool, is_last_step: bool):
+        # PERFORMANCE KEY: Use native fp8×fp8 matmul, NOT dequantize-first!
+        # The TPU MXU does fp8×fp8 → fp32 accumulation in hardware.
+        # This is MUCH faster than fp32×fp32 matmul.
 
-    if quantize_activation:
-        # Quantize or reuse - use jax.lax.cond for potentially-traced quant
-        def quantize_branch():
-            x_q, x_scale = util.quantize_array_2d(
-                x_ref[...],
-                x_abs_max_ref[...],
-                x_q_dtype,
-                quant_block_size,
-                quant_block_size,
-            )
-            if save_x_q:
-                x_q_scratch[...] = x_q
-                x_scale_scratch[...] = x_scale
-            return x_q, x_scale
-
-        def reuse_branch():
-            x_q = x_q_scratch[...]
-            # Use jax.lax.cond for conditional scale loading
-            x_scale = jax.lax.cond(
-                is_last_step,
-                lambda: x_scale_scratch[...],
-                lambda: jnp.zeros((1, 1), dtype=jnp.float32),  # dummy value
-            )
-            return x_q, x_scale
-
-        x_q_tmp, x_scale_tmp = jax.lax.cond(quant, quantize_branch, reuse_branch)
-
-        # Native fp8×fp8 matmul with fp32 accumulation
-        acc = jax.lax.dot_general(
-            x_q_tmp,
-            w_q_ref[...],
-            (((1,), (1,)), ((), ())),
-            preferred_element_type=acc_dtype,
-        )
-    else:
-        # bf16 activation × fp8 weight
-        acc = jax.lax.dot_general(
-            x_ref[...],
-            w_q_ref[...],
-            (((1,), (1,)), ((), ())),
-            preferred_element_type=acc_dtype,
-        )
-        x_scale_tmp = None  # Not used when not quantizing
-
-    # Accumulate across in_block dimension - use jax.lax.select
-    acc = jax.lax.select(is_first_step, acc, acc + acc_scratch[...])
-
-    # Scale and output - use jax.lax.cond for is_last_step
-    def output_branch():
-        # Apply both scales: result = matmul * w_scale * x_scale
-        # w_scale_ref and x_scale are scalars (1,1), will broadcast
-        acc_final = acc.astype(jnp.float32)
-        acc_final *= w_scale_ref[0, 0]  # Extract scalar from (1,1) array
         if quantize_activation:
-            acc_final *= x_scale_tmp[0, 0]  # Extract scalar from (1,1) array
-        out_ref[...] = acc_final.astype(x_ref_dtype)
+            if quant:
+                x_q_tmp, x_scale_tmp = util.quantize_array_2d(
+                    x_ref[...],
+                    x_abs_max_ref[...],
+                    x_q_dtype,
+                    quant_block_size,
+                    quant_block_size,
+                )
+                if save_x_q:
+                    x_q_scratch[...] = x_q_tmp
+                    x_scale_scratch[...] = x_scale_tmp
 
-    def save_branch():
-        acc_scratch[...] = acc
+            else:
+                assert save_x_q
+                x_q_tmp = x_q_scratch[...]
+                if is_last_step:
+                    x_scale_tmp = x_scale_scratch[...]
 
-    jax.lax.cond(is_last_step, output_branch, save_branch)
+            # Native fp8×fp8 matmul with fp32 accumulation
+            acc = jax.lax.dot_general(
+                x_q_tmp,
+                w_q_ref[...],
+                (((1,), (1,)), ((), ())),
+                preferred_element_type=acc_dtype,
+            )
+        else:
+            # bf16 activation × fp8 weight
+            acc = jax.lax.dot_general(
+                x_ref[...],
+                w_q_ref[...],
+                (((1,), (1,)), ((), ())),
+                preferred_element_type=acc_dtype,
+            )
+
+        # Accumulate across in_block dimension
+        if not is_first_step:
+            acc += acc_scratch[...]
+
+        # Scale and output
+        if is_last_step:
+            # Apply both scales: result = matmul * w_scale * x_scale
+            # w_scale_ref and x_scale are scalars (1,1), will broadcast
+            acc_final = acc.astype(jnp.float32)
+            acc_final *= w_scale_ref[0, 0]  # Extract scalar from (1,1) array
+            if quantize_activation:
+                acc_final *= x_scale_tmp[0, 0]  # Extract scalar from (1,1) array
+            out_ref[...] = acc_final.astype(x_ref_dtype)
+        else:
+            assert save_acc
+            acc_scratch[...] = acc
+
+    unfold_args((quant, is_first_step, is_last_step), (), matmul_body)
 
 
 @functools.partial(
