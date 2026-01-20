@@ -34,7 +34,6 @@ from tpu_inference.kernels.fp8_quantized_matmul_2d.v2.tuned_block_sizes import (
 from tpu_inference.kernels.fp8_quantized_matmul_2d.v2.util import (
     get_kernel_name,
     next_multiple,
-    unfold_args,
 )
 
 quantize_tensor_2d = util.quantize_tensor_2d
@@ -179,17 +178,21 @@ def matmul_kernel_2d_async_dma(
     is_first_step = in_idx == 0
     is_last_step = in_idx == (n_in - 1)
 
-    # Prefetch first iteration
-    if is_first_step:
+    # Prefetch first iteration - use jax.lax.cond
+    def prefetch_first():
         start_fetch_x(batch_idx, out_idx, in_idx)
         start_fetch_w(batch_idx, out_idx, in_idx)
         start_fetch_scales(batch_idx, out_idx, in_idx)
 
-    # Prefetch next iteration (if not last)
-    if not is_last_step:
+    jax.lax.cond(is_first_step, prefetch_first, lambda: None)
+
+    # Prefetch next iteration (if not last) - use jax.lax.cond
+    def prefetch_next():
         start_fetch_x(batch_idx, out_idx, in_idx + 1)
         start_fetch_w(batch_idx, out_idx, in_idx + 1)
         start_fetch_scales(batch_idx, out_idx, in_idx + 1)
+
+    jax.lax.cond(is_last_step, lambda: None, prefetch_next)
 
     # Wait for current iteration data
     wait_fetch(in_idx)
@@ -198,21 +201,34 @@ def matmul_kernel_2d_async_dma(
 
     # Quantize activation if needed
     if quantize_activation:
-        if out_idx == 0 or not save_x_q:  # Quantize
-            x_q_tmp, x_scale_tmp = util.quantize_array_2d(
+        # Determine if we should quantize or reuse - use jax.lax.cond
+        quant = out_idx == 0 if save_x_q else True
+
+        def quantize_branch():
+            x_q, x_scale = util.quantize_array_2d(
                 x_x2_vmem[buf_id],
                 x_abs_max_x2_vmem[buf_id],
                 x_q_dtype,
                 quant_block_size,
                 quant_block_size,
             )
-            if save_x_q and out_idx == 0:
-                x_q_scratch[...] = x_q_tmp
-                x_scale_scratch[...] = x_scale_tmp
-        else:  # Reuse quantized
-            x_q_tmp = x_q_scratch[...]
-            if is_last_step:
-                x_scale_tmp = x_scale_scratch[...]
+            if save_x_q:
+                # Only save when out_idx == 0 (handled by quant condition)
+                x_q_scratch[...] = x_q
+                x_scale_scratch[...] = x_scale
+            return x_q, x_scale
+
+        def reuse_branch():
+            x_q = x_q_scratch[...]
+            # Use jax.lax.cond for conditional scale loading
+            x_scale = jax.lax.cond(
+                is_last_step,
+                lambda: x_scale_scratch[...],
+                lambda: jnp.zeros((1, 1), dtype=jnp.float32),
+            )
+            return x_q, x_scale
+
+        x_q_tmp, x_scale_tmp = jax.lax.cond(quant, quantize_branch, reuse_branch)
 
         # Native fp8×fp8 matmul
         acc = jax.lax.dot_general(
@@ -229,33 +245,38 @@ def matmul_kernel_2d_async_dma(
             (((1,), (1,)), ((), ())),
             preferred_element_type=jnp.float32,
         )
+        x_scale_tmp = None  # Not used when not quantizing
 
-    # Accumulate across in dimension
-    if not is_first_step:
-        acc += acc_vmem[...]
+    # Accumulate across in dimension - use jax.lax.select
+    acc = jax.lax.select(is_first_step, acc, acc + acc_vmem[...])
 
-    # Output on last step
-    if is_last_step:
+    # Output on last step - use jax.lax.cond
+    def output_branch():
         # Apply scales
-        acc = acc.astype(jnp.float32)
-        acc *= w_scale_x2_vmem[buf_id, 0, 0]
+        acc_final = acc.astype(jnp.float32)
+        acc_final *= w_scale_x2_vmem[buf_id, 0, 0]
         if quantize_activation:
-            acc *= x_scale_tmp[0, 0]
+            acc_final *= x_scale_tmp[0, 0]
 
         # Store to output buffer (will be written to HBM async)
-        out_x2_vmem[buf_id, ...] = acc.astype(x_ref_dtype)
+        out_x2_vmem[buf_id, ...] = acc_final.astype(x_ref_dtype)
 
-        # Wait for previous output store (if any)
-        if in_idx > 0:
+        # Wait for previous output store (if any) - use jax.lax.cond
+        def wait_prev():
             wait_store(in_idx - 1)
+
+        jax.lax.cond(in_idx > 0, wait_prev, lambda: None)
 
         # Start storing current output
         start_store_out(batch_idx, out_idx)
 
         # Wait for current output to finish
         wait_store(in_idx)
-    else:
+
+    def save_branch():
         acc_vmem[...] = acc
+
+    jax.lax.cond(is_last_step, output_branch, save_branch)
 
 
 @functools.partial(
