@@ -1,0 +1,148 @@
+INFO 01-20 21:29:58 [__init__.py:59] TPU info: node_name=patemotter-v7x-8 | tpu_type=tpu7x-8 | worker_id=0 | num_chips=8 | num_cores_per_chip=2
+Note: JAX_PLATFORMS not set. Using default backend.
+For TPU testing, set: export JAX_PLATFORMS=tpu
+
+================================================================================
+FP8 2D Quantized Matmul - Correctness Test Suite
+================================================================================
+
+================================================================================
+Test: 1024×1024 @ 1024×1024, quant_block=256
+================================================================================
+
+Computing reference (pure JAX)...
+  Reference computed: (1024, 1024)
+
+Testing v1 (Auto Double Buffer)...
+------------------------------------------------------------
+  ❌ ERROR: 'NoneType' object is not subscriptable
+
+Testing v2 (Manual Async DMA)...
+------------------------------------------------------------
+  ❌ ERROR: Attempted boolean conversion of traced array with shape bool[].
+The error occurred while tracing the function prefetch_first at /mnt/disks/persist/my_tpu_inference/tpu_inference/kernels/fp8_quantized_matmul_2d/v2/kernel.py:182 for cond. This value became a tracer due to JAX operations on these lines:
+
+  operation b:i32[] = jit[
+  name=remainder
+  jaxpr={ lambda ; a:i32[] c:i32[]. let
+      d:i32[] = convert_element_type[new_dtype=int32 weak_type=False] c
+      e:bool[] = eq d 0:i32[]
+      f:i32[] = jit[
+        name=_where
+        jaxpr={ lambda ; e:bool[] g:i32[] d:i32[]. let
+            f:i32[] = select_n e d g
+          in (f,) }
+      ] e 1:i32[] d
+      h:i32[] = rem a f
+      i:bool[] = ne h 0:i32[]
+      j:bool[] = lt h 0:i32[]
+      k:bool[] = lt f 0:i32[]
+      l:bool[] = ne j k
+      m:bool[] = and l i
+      n:i32[] = add h f
+      b:i32[] = select_n m h n
+    in (b,) }
+] a 2:i32[]
+    from line /mnt/disks/persist/my_tpu_inference/tpu_inference/kernels/fp8_quantized_matmul_2d/v2/kernel.py:90:15 (matmul_kernel_2d_async_dma.<locals>.get_buffer_id)
+
+  operation a:i32[] = mul b 256:i32[]
+    from line /mnt/disks/persist/my_tpu_inference/tpu_inference/kernels/fp8_quantized_matmul_2d/v2/kernel.py:97:22 (matmul_kernel_2d_async_dma.<locals>.start_fetch_x)
+
+  operation a:i32[] = mul b 256:i32[]
+    from line /mnt/disks/persist/my_tpu_inference/tpu_inference/kernels/fp8_quantized_matmul_2d/v2/kernel.py:98:22 (matmul_kernel_2d_async_dma.<locals>.start_fetch_x)
+
+  operation dma_start(p0) a[b:b+256,c:c+256] -> d[e,:,:] f[e,0]
+    from line /mnt/disks/persist/my_tpu_inference/tpu_inference/kernels/fp8_quantized_matmul_2d/v2/kernel.py:102:10 (matmul_kernel_2d_async_dma.<locals>.start_fetch_x)
+
+  operation b:i32[] = jit[
+  name=remainder
+  jaxpr={ lambda ; a:i32[] c:i32[]. let
+      d:i32[] = convert_element_type[new_dtype=int32 weak_type=False] c
+      e:bool[] = eq d 0:i32[]
+      f:i32[] = jit[
+        name=_where
+        jaxpr={ lambda ; e:bool[] g:i32[] d:i32[]. let
+            f:i32[] = select_n e d g
+          in (f,) }
+      ] e 1:i32[] d
+      h:i32[] = rem a f
+      i:bool[] = ne h 0:i32[]
+      j:bool[] = lt h 0:i32[]
+      k:bool[] = lt f 0:i32[]
+      l:bool[] = ne j k
+      m:bool[] = and l i
+      n:i32[] = add h f
+      b:i32[] = select_n m h n
+    in (b,) }
+] a 2:i32[]
+    from line /mnt/disks/persist/my_tpu_inference/tpu_inference/kernels/fp8_quantized_matmul_2d/v2/kernel.py:90:15 (matmul_kernel_2d_async_dma.<locals>.get_buffer_id)
+
+(Additional originating lines are not shown.)
+See https://docs.jax.dev/en/latest/errors.html#jax.errors.TracerBoolConversionError
+
+Testing v3 (SMEM Scales)...
+------------------------------------------------------------
+  ❌ ERROR: Attempted boolean conversion of traced array with shape bool[].
+The error occurred while tracing the function prefetch_first at /mnt/disks/persist/my_tpu_inference/tpu_inference/kernels/fp8_quantized_matmul_2d/v3/kernel.py:179 for cond. This value became a tracer due to JAX operations on these lines:
+
+  operation b:i32[] = jit[
+  name=remainder
+  jaxpr={ lambda ; a:i32[] c:i32[]. let
+      d:i32[] = convert_element_type[new_dtype=int32 weak_type=False] c
+      e:bool[] = eq d 0:i32[]
+      f:i32[] = jit[
+        name=_where
+        jaxpr={ lambda ; e:bool[] g:i32[] d:i32[]. let
+            f:i32[] = select_n e d g
+          in (f,) }
+      ] e 1:i32[] d
+      h:i32[] = rem a f
+      i:bool[] = ne h 0:i32[]
+      j:bool[] = lt h 0:i32[]
+      k:bool[] = lt f 0:i32[]
+      l:bool[] = ne j k
+      m:bool[] = and l i
+      n:i32[] = add h f
+      b:i32[] = select_n m h n
+    in (b,) }
+] a 2:i32[]
+    from line /mnt/disks/persist/my_tpu_inference/tpu_inference/kernels/fp8_quantized_matmul_2d/v3/kernel.py:87:15 (matmul_kernel_2d_smem.<locals>.get_buffer_id)
+
+  operation a:i32[] = mul b 256:i32[]
+    from line /mnt/disks/persist/my_tpu_inference/tpu_inference/kernels/fp8_quantized_matmul_2d/v3/kernel.py:96:22 (matmul_kernel_2d_smem.<locals>.start_fetch)
+
+  operation a:i32[] = mul b 256:i32[]
+    from line /mnt/disks/persist/my_tpu_inference/tpu_inference/kernels/fp8_quantized_matmul_2d/v3/kernel.py:97:22 (matmul_kernel_2d_smem.<locals>.start_fetch)
+
+  operation dma_start(p0) a[b:b+256,c:c+256] -> d[e,:,:] f[e,0]
+    from line /mnt/disks/persist/my_tpu_inference/tpu_inference/kernels/fp8_quantized_matmul_2d/v3/kernel.py:101:10 (matmul_kernel_2d_smem.<locals>.start_fetch)
+
+  operation a:i32[] = mul b 256:i32[]
+    from line /mnt/disks/persist/my_tpu_inference/tpu_inference/kernels/fp8_quantized_matmul_2d/v3/kernel.py:105:22 (matmul_kernel_2d_smem.<locals>.start_fetch)
+
+(Additional originating lines are not shown.)
+See https://docs.jax.dev/en/latest/errors.html#jax.errors.TracerBoolConversionError
+
+================================================================================
+TEST SUMMARY
+================================================================================
+
+v1: ❌ FAIL
+  Passed: 0/1
+  Failed: 1/1
+
+v2: ❌ FAIL
+  Passed: 0/1
+  Failed: 1/1
+
+v3: ❌ FAIL
+  Passed: 0/1
+  Failed: 1/1
+
+================================================================================
+❌ SOME TESTS FAILED - Fix errors before benchmarking
+
+Debug steps:
+  1. Check HLO output: ./scripts/quick_hlo_check.sh
+  2. Review failed kernel implementations
+  3. Verify quantization is consistent
