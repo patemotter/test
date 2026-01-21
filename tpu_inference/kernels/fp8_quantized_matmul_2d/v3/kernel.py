@@ -249,8 +249,8 @@ def matmul_kernel_2d_smem(
 
             out_x2_vmem[buf_id, ...] = acc_final.astype(x_ref_dtype)
 
-            # Wait for previous output store (if any)
-            if in_idx > 0:
+            # Wait for previous output store (if any) - only if not first step
+            if not is_first_step:
                 wait_store(in_idx - 1)
 
             start_store_out(batch_idx, out_idx)

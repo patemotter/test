@@ -255,8 +255,8 @@ def matmul_kernel_2d_async_dma(
             # Store to output buffer (will be written to HBM async)
             out_x2_vmem[buf_id, ...] = acc_final.astype(x_ref_dtype)
 
-            # Wait for previous output store (if any)
-            if in_idx > 0:
+            # Wait for previous output store (if any) - only if not first step
+            if not is_first_step:
                 wait_store(in_idx - 1)
 
             # Start storing current output
