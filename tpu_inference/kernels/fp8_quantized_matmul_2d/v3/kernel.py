@@ -1,20 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""V3: SMEM for scales + async DMA (aligned blocks only).
+"""V3: Manual async DMA for large tensors + automatic BlockSpec for scales (aligned blocks only).
 
-This version uses SMEM (Scalar Memory) for scale factors, which is faster than VMEM
-for small frequently-accessed data. Combined with async DMA for data transfers.
+This version uses manual async DMA for large data blocks and automatic BlockSpec
+transfers for small scale factors to avoid DMA alignment issues.
 
 Key features:
-- SMEM for scale storage (faster access than VMEM)
-- Async DMA for data blocks
+- Manual async DMA for large tensors (x, w_q, out)
+- Automatic BlockSpec transfer for small scales (avoids DMA alignment issues)
 - Double-buffered data in VMEM
-- Optimal for small scale tensors
+- Explicit semaphore synchronization
 
 Trade-offs:
-- SMEM capacity is limited (~32KB)
-- Only beneficial when scales are small
-- Aligned blocks only (scales are 1×1 per kernel)
-- More complex memory hierarchy management
+- Aligned blocks only (kernel_block == quant_block)
+- More complex than V1 but avoids DMA alignment issues
+- Scales use automatic transfer (simpler than manual DMA for small tensors)
 """
 
 import functools
@@ -45,38 +44,40 @@ def matmul_kernel_2d_smem(
     # HBM inputs
     x_hbm: jax.Array,
     w_q_hbm: jax.Array,
-    w_scale_hbm: jax.Array,
-    x_abs_max_hbm: jax.Array,
     out_hbm: jax.Array,
+    # VMEM refs (automatically transferred via BlockSpec)
+    w_scale_ref: jax.Array,  # (1, 1) - scalar per kernel block
+    x_abs_max_ref: jax.Array,  # (1, 1) - scalar per kernel block
     # VMEM scratch (double buffered for data)
     x_x2_vmem: jax.Array,  # (2, quant_block_size, quant_block_size)
     w_q_x2_vmem: jax.Array,  # (2, quant_block_size, quant_block_size)
     out_x2_vmem: jax.Array,  # (2, quant_block_size, quant_block_size)
     acc_vmem: jax.Array,  # (quant_block_size, quant_block_size)
     x_q_scratch: jax.Array,  # (quant_block_size, quant_block_size)
-    x_scale_scratch_vmem: jax.Array,  # (1, 1) in VMEM
-    # SMEM scratch (for scales - faster access)
-    w_scale_x2_smem: jax.Array,  # (2, 1, 1) in SMEM
-    x_abs_max_x2_smem: jax.Array,  # (2, 1, 1) in SMEM
-    x_scale_scratch_smem: jax.Array,  # (1, 1) in SMEM
-    sems: jax.Array,  # (2, 5)
+    x_scale_scratch: jax.Array,  # (1, 1)
+    sems: jax.Array,  # (2, 3)
     *,
     x_q_dtype: jnp.dtype,
     quant_block_size: int,
     save_x_q: bool,
 ):
-    """Pallas kernel with SMEM for scales + async DMA.
+    """Pallas kernel with async DMA for large tensors.
 
     V3 OPTIMIZATIONS:
-    - SMEM for scale factors (faster than VMEM for small data)
-    - Async DMA for data blocks
+    - Manual async DMA for large tensors (avoids alignment issues)
+    - Automatic BlockSpec transfer for small scales (avoids DMA alignment issues)
     - Double-buffered data transfers
-    - Reduced VMEM pressure (scales in SMEM)
+    - Explicit semaphore synchronization
 
     Memory hierarchy:
-    - Data blocks (x, w_q, out): VMEM (double buffered)
-    - Scales (w_scale, x_abs_max, x_scale): SMEM (double buffered)
+    - Data blocks (x, w_q, out): VMEM (double buffered, manual DMA)
+    - Scales (w_scale, x_abs_max): VMEM refs (auto-transferred)
     - Accumulator: VMEM (single buffer)
+
+    Semaphore layout (sems[buffer_id, sem_type]):
+    - sem 0: x transfer
+    - sem 1: w_q transfer
+    - sem 2: out transfer
     """
     batch_idx, out_idx, in_idx = pl.program_id(0), pl.program_id(1), pl.program_id(2)
     n_in = pl.num_programs(2)
@@ -88,7 +89,7 @@ def matmul_kernel_2d_smem(
         return idx % 2
 
     def start_fetch(b_idx, o_idx, i_idx):
-        """Start async fetch of all data for iteration i_idx."""
+        """Start async fetch of data blocks for iteration i_idx."""
         buf_id = get_buffer_id(i_idx)
 
         # Fetch data blocks to VMEM
@@ -110,20 +111,6 @@ def matmul_kernel_2d_smem(
             sem=sems.at[buf_id, 1],
         ).start()
 
-        # Fetch scales to SMEM (faster access)
-        pltpu.make_async_copy(
-            src_ref=w_scale_hbm.at[o_idx:o_idx+1, i_idx:i_idx+1],
-            dst_ref=w_scale_x2_smem.at[buf_id],
-            sem=sems.at[buf_id, 2],
-        ).start()
-
-        if quantize_activation:
-            pltpu.make_async_copy(
-                src_ref=x_abs_max_hbm.at[b_idx:b_idx+1, i_idx:i_idx+1],
-                dst_ref=x_abs_max_x2_smem.at[buf_id],
-                sem=sems.at[buf_id, 3],
-            ).start()
-
     def wait_fetch(i_idx):
         """Wait for async fetches to complete."""
         buf_id = get_buffer_id(i_idx)
@@ -140,19 +127,6 @@ def matmul_kernel_2d_smem(
             sem=sems.at[buf_id, 1],
         ).wait()
 
-        pltpu.make_async_copy(
-            src_ref=w_scale_x2_smem.at[buf_id],
-            dst_ref=w_scale_x2_smem.at[buf_id],
-            sem=sems.at[buf_id, 2],
-        ).wait()
-
-        if quantize_activation:
-            pltpu.make_async_copy(
-                src_ref=x_abs_max_x2_smem.at[buf_id],
-                dst_ref=x_abs_max_x2_smem.at[buf_id],
-                sem=sems.at[buf_id, 3],
-            ).wait()
-
     def start_store_out(b_idx, o_idx):
         buf_id = get_buffer_id(in_idx)
         pltpu.make_async_copy(
@@ -161,7 +135,7 @@ def matmul_kernel_2d_smem(
                 pl.ds(b_idx * quant_block_size, quant_block_size),
                 pl.ds(o_idx * quant_block_size, quant_block_size),
             ],
-            sem=sems.at[buf_id, 4],
+            sem=sems.at[buf_id, 2],
         ).start()
 
     def wait_store(i_idx):
@@ -169,7 +143,7 @@ def matmul_kernel_2d_smem(
         pltpu.make_async_copy(
             src_ref=out_x2_vmem.at[buf_id],
             dst_ref=out_x2_vmem.at[buf_id],
-            sem=sems.at[buf_id, 4],
+            sem=sems.at[buf_id, 2],
         ).wait()
 
     # Initialize conditional logic
@@ -197,28 +171,23 @@ def matmul_kernel_2d_smem(
         # Quantize activation if needed
         if quantize_activation:
             if quant:
-                # OPTIMIZATION: Read abs_max from SMEM (faster than VMEM)
-                x_q_tmp, x_scale_vmem = util.quantize_array_2d(
+                x_q_tmp, x_scale_tmp = util.quantize_array_2d(
                     x_x2_vmem[buf_id],
-                    x_abs_max_x2_smem[buf_id],  # SMEM access
+                    x_abs_max_ref,  # Use VMEM ref directly (auto-transferred)
                     x_q_dtype,
                     quant_block_size,
                     quant_block_size,
                 )
-                # Store scale to SMEM for next access
-                x_scale_scratch_smem[...] = x_scale_vmem
-
                 if save_x_q:
                     # Only save when out_idx == 0 (handled by quant condition)
                     x_q_scratch[...] = x_q_tmp
-                    x_scale_scratch_vmem[...] = x_scale_vmem
+                    x_scale_scratch[...] = x_scale_tmp
 
             else:
                 assert save_x_q
                 x_q_tmp = x_q_scratch[...]
                 if is_last_step:
-                    x_scale_vmem = x_scale_scratch_vmem[...]
-                    x_scale_scratch_smem[...] = x_scale_vmem
+                    x_scale_tmp = x_scale_scratch[...]
 
             # Native fp8×fp8 matmul
             acc = jax.lax.dot_general(
@@ -242,10 +211,9 @@ def matmul_kernel_2d_smem(
         # Output
         if is_last_step:
             acc_final = acc.astype(jnp.float32)
-            # OPTIMIZATION: Read scale from SMEM (faster access)
-            acc_final *= w_scale_x2_smem[buf_id, 0, 0]
+            acc_final *= w_scale_ref[0, 0]  # Use VMEM ref directly (auto-transferred)
             if quantize_activation:
-                acc_final *= x_scale_scratch_smem[0, 0]
+                acc_final *= x_scale_tmp[0, 0]
 
             out_x2_vmem[buf_id, ...] = acc_final.astype(x_ref_dtype)
 
@@ -279,18 +247,18 @@ def fp8_quantized_matmul_2d_kernel(
     *,
     tuned_value: TunedValue | None = None,
 ) -> jax.Array:
-    """V3: 2D fp8 quantized matmul with SMEM for scales.
+    """V3: 2D fp8 quantized matmul with explicit async DMA.
 
     PERFORMANCE-CRITICAL OPTIMIZATIONS:
-    - **SMEM for scales**: Faster access than VMEM for small data
     - **Native fp8×fp8 matmul**: Hardware MXU acceleration
-    - **Async DMA**: Overlaps compute with memory transfers
-    - **Reduced VMEM pressure**: Scales moved to SMEM
+    - **Manual async DMA for large tensors**: Fine-grained control over prefetch
+    - **Automatic BlockSpec for scales**: Avoids DMA alignment issues
+    - **Double-buffered VMEM**: Overlaps compute with memory transfers
 
-    Benefits of SMEM:
-    - ~2-3× faster access than VMEM for small data
-    - Reduces VMEM contention
-    - Perfect for scales (just 1×1 per aligned block)
+    Key insight:
+    - Small scalar-like values (1×1 scales) use automatic Pallas transfers
+    - Large tensors (quant_block_size × quant_block_size) use manual async DMA
+    - This hybrid approach avoids TPU DMA alignment requirements (8, 128)
 
     NOTE: Currently only supports aligned blocks.
     """
@@ -403,7 +371,9 @@ def fp8_quantized_matmul_2d_kernel(
 
     save_x_q = quantize_activation and n_in == 1 and n_out > 1
 
-    # V3: SMEM for scales, VMEM for data
+    # V3: Use explicit BlockSpec
+    # - HBM for large tensors (x, w_q, out) with manual async DMA
+    # - VMEM refs for small scales (w_scale, x_abs_max) with automatic transfer
     kernel = pl.pallas_call(
         functools.partial(
             matmul_kernel_2d_smem,
@@ -414,26 +384,33 @@ def fp8_quantized_matmul_2d_kernel(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[
+                # HBM inputs (manual async DMA)
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),  # x_hbm
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),  # w_q_hbm
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),  # w_scale_hbm
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),  # x_abs_max_hbm
+                # HBM output (manual async DMA)
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),  # out_hbm
+                # VMEM refs (automatic transfer - avoids DMA alignment issues)
+                pl.BlockSpec(
+                    (1, 1),  # Single scale per kernel block
+                    lambda b, o, i: (o, i),
+                ),  # w_scale_ref
+                pl.BlockSpec(
+                    (1, 1),  # Single abs_max per kernel block
+                    lambda b, o, i: (b, i),
+                ),  # x_abs_max_ref
             ],
-            out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            out_specs=None,  # out_hbm is in in_specs
             scratch_shapes=[
-                # VMEM for data blocks (double buffered)
+                # Double-buffered VMEM for large tensors
                 pltpu.VMEM((2, quant_block_size, quant_block_size), x.dtype),  # x_x2
                 pltpu.VMEM((2, quant_block_size, quant_block_size), w_q.dtype),  # w_q_x2
                 pltpu.VMEM((2, quant_block_size, quant_block_size), x.dtype),  # out_x2
+                # Single-buffered scratch
                 pltpu.VMEM((quant_block_size, quant_block_size), jnp.float32),  # acc
                 pltpu.VMEM((quant_block_size, quant_block_size), x_q_dtype) if save_x_q else None,  # x_q
-                pltpu.VMEM((1, 1), jnp.float32) if save_x_q else None,  # x_scale_vmem
-                # SMEM for scales (faster access, double buffered)
-                pltpu.SMEM((2, 1, 1), jnp.float32),  # w_scale_x2_smem
-                pltpu.SMEM((2, 1, 1), jnp.float32),  # x_abs_max_x2_smem
-                pltpu.SMEM((1, 1), jnp.float32),  # x_scale_smem
-                # Semaphores for async DMA synchronization
-                pltpu.SemaphoreType.DMA((2, 5)),
+                pltpu.VMEM((1, 1), jnp.float32) if save_x_q else None,  # x_scale
+                # Semaphores for async DMA synchronization (only for x, w_q, out)
+                pltpu.SemaphoreType.DMA((2, 3)),  # sems[buffer_id, sem_type]
             ],
             grid=(n_batch, n_out, n_in),
         ),

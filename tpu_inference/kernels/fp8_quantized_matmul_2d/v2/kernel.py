@@ -45,19 +45,18 @@ def matmul_kernel_2d_async_dma(
     # HBM inputs
     x_hbm: jax.Array,  # (padded_n_batch, padded_n_in)
     w_q_hbm: jax.Array,  # (padded_n_out, padded_n_in)
-    w_scale_hbm: jax.Array,  # (n_out_blocks, n_in_blocks)
-    x_abs_max_hbm: jax.Array,  # (n_batch_blocks, n_in_blocks)
     out_hbm: jax.Array,  # (padded_n_batch, padded_n_out)
+    # VMEM refs (automatically transferred via BlockSpec)
+    w_scale_ref: jax.Array,  # (1, 1) - scalar per kernel block
+    x_abs_max_ref: jax.Array,  # (1, 1) - scalar per kernel block
     # VMEM scratch (double buffered)
     x_x2_vmem: jax.Array,  # (2, quant_block_size, quant_block_size)
     w_q_x2_vmem: jax.Array,  # (2, quant_block_size, quant_block_size)
-    w_scale_x2_vmem: jax.Array,  # (2, 1, 1)
-    x_abs_max_x2_vmem: jax.Array,  # (2, 1, 1)
     out_x2_vmem: jax.Array,  # (2, quant_block_size, quant_block_size)
     acc_vmem: jax.Array,  # (quant_block_size, quant_block_size) - not double buffered
     x_q_scratch: jax.Array,  # (quant_block_size, quant_block_size)
     x_scale_scratch: jax.Array,  # (1, 1)
-    sems: jax.Array,  # (2, 5) - semaphores for synchronization
+    sems: jax.Array,  # (2, 3) - semaphores for synchronization
     *,
     x_q_dtype: jnp.dtype,
     quant_block_size: int,
@@ -66,17 +65,16 @@ def matmul_kernel_2d_async_dma(
     """Pallas kernel with EXPLICIT async DMA and semaphores.
 
     V2 OPTIMIZATIONS:
-    - Manual async copy with pltpu.make_async_copy()
+    - Manual async copy with pltpu.make_async_copy() for large tensors
+    - Automatic BlockSpec transfer for small scales (avoids DMA alignment issues)
     - Explicit semaphore synchronization
-    - Double-buffered inputs (x2 pattern)
+    - Double-buffered data inputs (x2 pattern)
     - Fine-grained control over prefetch timing
 
     Semaphore layout (sems[buffer_id, sem_type]):
     - sem 0: x transfer
     - sem 1: w_q transfer
-    - sem 2: w_scale transfer
-    - sem 3: x_abs_max transfer
-    - sem 4: out transfer
+    - sem 2: out transfer
     """
     # Grid indices
     batch_idx, out_idx, in_idx = pl.program_id(0), pl.program_id(1), pl.program_id(2)
@@ -114,21 +112,6 @@ def matmul_kernel_2d_async_dma(
             sem=sems.at[buf_id, 1],
         ).start()
 
-    def start_fetch_scales(b_idx, o_idx, i_idx):
-        """Start async fetch of scales."""
-        buf_id = get_buffer_id(i_idx)
-        pltpu.make_async_copy(
-            src_ref=w_scale_hbm.at[o_idx:o_idx+1, i_idx:i_idx+1],
-            dst_ref=w_scale_x2_vmem.at[buf_id],
-            sem=sems.at[buf_id, 2],
-        ).start()
-        if quantize_activation:
-            pltpu.make_async_copy(
-                src_ref=x_abs_max_hbm.at[b_idx:b_idx+1, i_idx:i_idx+1],
-                dst_ref=x_abs_max_x2_vmem.at[buf_id],
-                sem=sems.at[buf_id, 3],
-            ).start()
-
     def wait_fetch(i_idx):
         """Wait for async fetches to complete."""
         buf_id = get_buffer_id(i_idx)
@@ -142,17 +125,6 @@ def matmul_kernel_2d_async_dma(
             dst_ref=w_q_x2_vmem.at[buf_id],
             sem=sems.at[buf_id, 1],
         ).wait()
-        pltpu.make_async_copy(
-            src_ref=w_scale_x2_vmem.at[buf_id],
-            dst_ref=w_scale_x2_vmem.at[buf_id],
-            sem=sems.at[buf_id, 2],
-        ).wait()
-        if quantize_activation:
-            pltpu.make_async_copy(
-                src_ref=x_abs_max_x2_vmem.at[buf_id],
-                dst_ref=x_abs_max_x2_vmem.at[buf_id],
-                sem=sems.at[buf_id, 3],
-            ).wait()
 
     def start_store_out(b_idx, o_idx):
         """Start async store of output."""
@@ -163,7 +135,7 @@ def matmul_kernel_2d_async_dma(
                 pl.ds(b_idx * quant_block_size, quant_block_size),
                 pl.ds(o_idx * quant_block_size, quant_block_size),
             ],
-            sem=sems.at[buf_id, 4],
+            sem=sems.at[buf_id, 2],
         ).start()
 
     def wait_store(i_idx):
@@ -172,7 +144,7 @@ def matmul_kernel_2d_async_dma(
         pltpu.make_async_copy(
             src_ref=out_x2_vmem.at[buf_id],
             dst_ref=out_x2_vmem.at[buf_id],
-            sem=sems.at[buf_id, 4],
+            sem=sems.at[buf_id, 2],
         ).wait()
 
     # Initialize conditional logic
@@ -190,13 +162,11 @@ def matmul_kernel_2d_async_dma(
         if is_first_step:
             start_fetch_x(batch_idx, out_idx, in_idx)
             start_fetch_w(batch_idx, out_idx, in_idx)
-            start_fetch_scales(batch_idx, out_idx, in_idx)
 
         # Prefetch next iteration (if not last)
         if not is_last_step:
             start_fetch_x(batch_idx, out_idx, in_idx + 1)
             start_fetch_w(batch_idx, out_idx, in_idx + 1)
-            start_fetch_scales(batch_idx, out_idx, in_idx + 1)
 
         # Wait for current iteration data
         wait_fetch(in_idx)
@@ -208,7 +178,7 @@ def matmul_kernel_2d_async_dma(
             if quant:
                 x_q_tmp, x_scale_tmp = util.quantize_array_2d(
                     x_x2_vmem[buf_id],
-                    x_abs_max_x2_vmem[buf_id],
+                    x_abs_max_ref,  # Use VMEM ref directly (auto-transferred)
                     x_q_dtype,
                     quant_block_size,
                     quant_block_size,
@@ -248,7 +218,7 @@ def matmul_kernel_2d_async_dma(
         if is_last_step:
             # Apply scales
             acc_final = acc.astype(jnp.float32)
-            acc_final *= w_scale_x2_vmem[buf_id, 0, 0]
+            acc_final *= w_scale_ref[0, 0]  # Use VMEM ref directly (auto-transferred)
             if quantize_activation:
                 acc_final *= x_scale_tmp[0, 0]
 
@@ -419,8 +389,9 @@ def fp8_quantized_matmul_2d_kernel(
 
     save_x_q = quantize_activation and n_in == 1 and n_out > 1
 
-    # V2: Use explicit BlockSpec with HBM inputs/outputs
-    # No automatic prefetching - we handle it manually
+    # V2: Use explicit BlockSpec
+    # - HBM for large tensors (x, w_q, out) with manual async DMA
+    # - VMEM refs for small scales (w_scale, x_abs_max) with automatic transfer
     kernel = pl.pallas_call(
         functools.partial(
             matmul_kernel_2d_async_dma,
@@ -431,26 +402,33 @@ def fp8_quantized_matmul_2d_kernel(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[
-                # HBM inputs (no automatic prefetch - we do manual async DMA)
+                # HBM inputs (manual async DMA)
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),  # x_hbm
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),  # w_q_hbm
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),  # w_scale_hbm
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),  # x_abs_max_hbm
+                # HBM output (manual async DMA)
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),  # out_hbm
+                # VMEM refs (automatic transfer - avoids DMA alignment issues)
+                pl.BlockSpec(
+                    (1, 1),  # Single scale per kernel block
+                    lambda b, o, i: (o, i),
+                ),  # w_scale_ref
+                pl.BlockSpec(
+                    (1, 1),  # Single abs_max per kernel block
+                    lambda b, o, i: (b, i),
+                ),  # x_abs_max_ref
             ],
-            out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),  # out_hbm
+            out_specs=None,  # out_hbm is in in_specs
             scratch_shapes=[
-                # Double-buffered VMEM
+                # Double-buffered VMEM for large tensors
                 pltpu.VMEM((2, quant_block_size, quant_block_size), x.dtype),  # x_x2
                 pltpu.VMEM((2, quant_block_size, quant_block_size), w_q.dtype),  # w_q_x2
-                pltpu.VMEM((2, 1, 1), jnp.float32),  # w_scale_x2
-                pltpu.VMEM((2, 1, 1), jnp.float32),  # x_abs_max_x2
                 pltpu.VMEM((2, quant_block_size, quant_block_size), x.dtype),  # out_x2
                 # Single-buffered scratch
                 pltpu.VMEM((quant_block_size, quant_block_size), jnp.float32),  # acc
                 pltpu.VMEM((quant_block_size, quant_block_size), x_q_dtype) if save_x_q else None,  # x_q
                 pltpu.VMEM((1, 1), jnp.float32) if save_x_q else None,  # x_scale
-                # Semaphores for async DMA synchronization
-                pltpu.SemaphoreType.DMA((2, 5)),  # sems[buffer_id, sem_type]
+                # Semaphores for async DMA synchronization (only for x, w_q, out)
+                pltpu.SemaphoreType.DMA((2, 3)),  # sems[buffer_id, sem_type]
             ],
             grid=(n_batch, n_out, n_in),
         ),
