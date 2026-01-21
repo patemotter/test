@@ -35,28 +35,16 @@ class ShardingAxisNameBase:
     SEQUENCE = ('data', 'attn_dp')
     ATTN_DATA = ('data', 'attn_dp')
     MLP_DATA = 'data'
-    TENSOR = 'model'
-    ATTN_HEAD = 'model'
-    ATTN_TENSOR = None
-    MLP_TENSOR = ('attn_dp', 'model', 'expert')
-    MOE_TENSOR = ('attn_dp', 'model')
-    EXPERT = ('attn_dp', 'expert', 'model')
-    VOCAB = ('expert', 'attn_dp', 'model')
-
-class ShardingAxisName2DTP:
-    """sharding class for sharding MoE tensors on 2D tensor parallelism."""
-    SEQUENCE = ('data', 'attn_dp')
-    ATTN_DATA = ('data', 'attn_dp')
-    MLP_DATA = 'data'
     TENSOR = ('model', 'expert')
     ATTN_HEAD = ('model', 'expert')
     ATTN_TENSOR = None
     MLP_TENSOR = ('attn_dp', 'model', 'expert')
     MOE_TENSOR = ('attn_dp', 'model')
-    EXPERT = ('attn_dp', 'expert', 'expert')
+    EXPERT = ('attn_dp', 'expert', 'model')
     VOCAB = ('model', 'attn_dp', 'expert')
     MODEL_1 = 'model'
     MODEL_2 = 'expert'
+
 
 class ShardingAxisName2D:
     """Sharding axis names for 2D data parallelism scenarios.
@@ -78,9 +66,7 @@ class ShardingAxisName2D:
 try:
     _use_2d_tp_sharding = envs.USE_2D_TP
     _use_base_sharding = envs.NEW_MODEL_DESIGN
-    if _use_2d_tp_sharding:
-        ShardingAxisName = ShardingAxisName2DTP
-    elif _use_base_sharding:
+    if _use_2d_tp_sharding or _use_base_sharding:
         ShardingAxisName = ShardingAxisNameBase
     else:
         ShardingAxisName = ShardingAxisName2D
@@ -135,7 +121,8 @@ class ShardingConfigManager:
             assert self._total_devices == len(device_indexes)
 
     @classmethod
-    def from_vllm_config(cls,
+    def from_vllm_config(
+                         cls,
                          vllm_config: 'VllmConfig') -> 'ShardingConfigManager':
 
         sharding_strategy = vllm_config.additional_config.get(
@@ -241,9 +228,10 @@ class ShardingConfigManager:
         return self._total_devices
 
     def __str__(self):
-        return (f"ShardingConfigManager(total_devices={self.total_devices}, "
-                f"sharding_strategy={self.sharding_strategy}, "
-                f"device_indexes={self.device_indexes})")
+        return (
+            f"ShardingConfigManager(total_devices={self.total_devices}, "
+            f"sharding_strategy={self.sharding_strategy}, "
+            f"device_indexes={self.device_indexes})")
 
 
 #TODO split this into block unique sharding config, i.e. attentionShardingConfig, MoEShardingConfig

@@ -12,26 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import enum
 from dataclasses import InitVar, dataclass
-from functools import partial
-from typing import Optional, Tuple
+from typing import Tuple
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 from flax.typing import Sharding
-from jax.sharding import PartitionSpec
 from jaxtyping import Float
-from qwix._src.core.ragged_dot import ragged_dot as qwix_ragged_dot
-from qwix._src.providers import ptq
 
 from tpu_inference.layers.jax.base import create_param
 from tpu_inference.layers.jax.layers import FlaxUtils
-from tpu_inference.layers.jax.moe.moe import CombineExperts, MoE, MoEBackend
 from tpu_inference.layers.jax.moe.utils import MoEBackend
-from tpu_inference.models.jax.utils.qwix.qwix_utils import (
-    manually_quantize_qwix_activation, manually_quantize_qwix_weight)
 
 modeling_flax_utils = FlaxUtils()
 
