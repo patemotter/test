@@ -27,7 +27,7 @@ from jax.sharding import PartitionSpec as P
 from torchax.ops.mappings import j2t_dtype
 from vllm.config import VllmConfig
 
-from tpu_inference import utils
+from tpu_inference import envs, utils
 from tpu_inference.layers.common.quantization import u8_unpack_e2m1
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.jax.attention.attention import AttentionMetadata
@@ -881,6 +881,22 @@ class DeepSeekV3(nnx.Module):
                 activation_ffw_td=(ShardingAxisName.MLP_DATA, None),
                 ed_sharding=(ShardingAxisName.MLP_TENSOR, None),
                 e_sharding=(ShardingAxisName.MLP_TENSOR, ))
+            # Use 2D TP sharding when enabled, otherwise use standard EP sharding
+            if envs.USE_2D_TP:
+                moe_activation_ffw_td = (ShardingAxisName.MLP_DATA,
+                                         ShardingAxisName.MODEL_1)
+                moe_activation_ffw_ted = (ShardingAxisName.MLP_DATA, None,
+                                          ShardingAxisName.MODEL_1)
+                moe_edf_sharding = (None, ShardingAxisName.MODEL_1,
+                                    ShardingAxisName.MODEL_2)
+                moe_efd_sharding = (None, ShardingAxisName.MODEL_2,
+                                    ShardingAxisName.MODEL_1)
+            else:
+                moe_activation_ffw_td = (ShardingAxisName.MLP_DATA, None)
+                moe_activation_ffw_ted = (ShardingAxisName.MLP_DATA, None, None)
+                moe_edf_sharding = (ShardingAxisName.MLP_TENSOR, None, None)
+                moe_efd_sharding = (ShardingAxisName.MLP_TENSOR, None, None)
+
             custom_module = MoE(
                 dtype=dtype,
                 num_local_experts=num_local_experts,
@@ -891,14 +907,10 @@ class DeepSeekV3(nnx.Module):
                 mesh=self.mesh,
                 hidden_act=hidden_act,
                 rngs=self.rng,
-                activation_ffw_td=(ShardingAxisName.MLP_DATA,
-                                   ShardingAxisName.MODEL_1),
-                activation_ffw_ted=(ShardingAxisName.MLP_DATA, None,
-                                    ShardingAxisName.MODEL_1),
-                edf_sharding=(None, ShardingAxisName.MODEL_1,
-                              ShardingAxisName.MODEL_2),
-                efd_sharding=(None, ShardingAxisName.MODEL_2,
-                              ShardingAxisName.MODEL_1),
+                activation_ffw_td=moe_activation_ffw_td,
+                activation_ffw_ted=moe_activation_ffw_ted,
+                edf_sharding=moe_edf_sharding,
+                efd_sharding=moe_efd_sharding,
                 moe_backend=self.moe_backend,
                 quantized_dtype=self.weight_loader.quant_dtype
                 if self.weight_loader.is_model_quantized else None,

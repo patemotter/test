@@ -55,6 +55,7 @@ class ShardingAxisName2D:
     SEQUENCE = 'data'
     ATTN_DATA = 'data'
     MLP_DATA = 'data'
+    TENSOR = 'model'
     ATTN_HEAD = 'model'
     ATTN_TENSOR = None
     MLP_TENSOR = 'model'
