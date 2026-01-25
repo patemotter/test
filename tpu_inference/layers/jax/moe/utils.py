@@ -21,9 +21,9 @@ from jax.experimental.pallas.ops.tpu.megablox.gmm import gmm as megablox_gmm
 from qwix._src.core.ragged_dot import ragged_dot as qwix_ragged_dot
 
 from tpu_inference import envs
-from tpu_inference.layers.jax.layers import FlaxUtils
-from tpu_inference.layers.jax.misc import \
+from tpu_inference.layers.common.fused_moe_gmm import \
     round_up_to_multiple_of_128_within_limit
+from tpu_inference.layers.jax.layers import FlaxUtils
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.utils.qwix.qwix_utils import \
     manually_quantize_qwix_activation
@@ -42,29 +42,29 @@ class MoEBackend(enum.Enum):
 
 
 def select_moe_backend():
+    # Validation: Ensure mutually exclusive flags aren't set together
+    if envs.USE_MOE_EP_KERNEL and envs.USE_VLLM_MOE_KERNEL:
+        raise ValueError("Cannot enable multiple MoE kernels simultaneously.")
 
-    assert sum([envs.USE_MOE_EP_KERNEL, envs.USE_VLLM_MOE_KERNEL
-                ]) <= 1, "You can enable at most one MoE kernels."
+    if envs.USE_MOE_EP_KERNEL:
+        logger.info("[MoE]: Fused MoE kernel is enabled")
+        return MoEBackend.FUSED_MOE
 
-    match (envs.USE_MOE_EP_KERNEL, envs.USE_VLLM_MOE_KERNEL,
-           envs.USE_MEGABLOCKS, envs.USE_RAGGED_DOT):
-        case (True, _, _, _):
-            logger.info("[MoE]: Fused MoE kernel is enabled")
-            return MoEBackend.FUSED_MOE
-        case (_, True, _, _):
-            logger.info("[MoE]: VLLM MoE kernel is enabled")
-            return MoEBackend.VLLM_MOE
-        case (_, _, True, _):
-            logger.info(
-                "[MoE]: Mega Blocks is enabled for GMM in Sparse Matmul")
-            return MoEBackend.MEGABLX_GMM
-        case (_, _, _, True):
-            logger.info(
-                "[MoE]: Ragged Dot is enabled for GMM in Sparse Matmul")
-            return MoEBackend.RAGGED_DOT
-        case _:
-            logger.info("[MoE]: Dense Matmul is enabled")
-            return MoEBackend.DENSE_MAT
+    if envs.USE_VLLM_MOE_KERNEL:
+        logger.info("[MoE]: VLLM MoE kernel is enabled")
+        return MoEBackend.VLLM_MOE
+
+    if envs.USE_MEGABLOCKS:
+        logger.info("[MoE]: Mega Blocks is enabled for GMM in Sparse Matmul")
+        return MoEBackend.MEGABLX_GMM
+
+    if envs.USE_RAGGED_DOT:
+        logger.info("[MoE]: Ragged Dot is enabled for GMM in Sparse Matmul")
+        return MoEBackend.RAGGED_DOT
+
+    # Default case
+    logger.info("[MoE]: Dense Matmul is enabled")
+    return MoEBackend.DENSE_MAT
 
 
 # --- Helper Functions/Class for Sparse MoE ---
@@ -112,14 +112,13 @@ def global_permute_fn(inputs_TD: jax.Array, selected_experts_TX: jax.Array,
 
 def unpermute_fn(processed_tokens: jax.Array, sort_indices: jax.Array,
                  router_weights_TX: jax.Array, num_experts_per_tok: int,
-                 output_dtype):
+                 hidden_size: int, output_dtype):
     """Stateless global unpermute logic."""
     with jax.named_scope("unpermute"):
         unsorted_tokens_tD = sort_activations_fn(processed_tokens,
                                                  jnp.argsort(sort_indices))
-        local_D = unsorted_tokens_tD.shape[-1]
         reshaped_tokens_TXD = unsorted_tokens_tD.reshape(
-            -1, num_experts_per_tok, local_D)
+            -1, num_experts_per_tok, hidden_size)
 
     with jax.named_scope("combine_weights"):
         output_TD = jnp.einsum(
@@ -141,9 +140,9 @@ def local_permute_fn(inputs,
     """Stateless local permutation logic."""
     # global_group_sizes: (tokens parallelism, num_total_experts)
     # all_shard_local_sizes: (tokens parallelism, num local experts in the shard)
+    start_index = shard_index * local_expert_size
     all_shard_local_sizes = jax.lax.dynamic_slice_in_dim(global_group_sizes,
-                                                         shard_index *
-                                                         local_expert_size,
+                                                         start_index,
                                                          local_expert_size,
                                                          axis=1)
     local_sizes = all_shard_local_sizes.reshape(-1)
@@ -249,7 +248,8 @@ def gmm_fn(inputs, kernel, group_sizes, tile_size, moe_backend, dtype,
         inputs = jnp.pad(inputs, ((0, pad_amount), (0, 0)))
 
     if moe_backend == MoEBackend.MEGABLX_GMM:
-        m, _, k, n = inputs.shape[0], *kernel.shape
+        m = inputs.shape[0]
+        _, k, n = kernel.shape
         tm = round_up_to_multiple_of_128_within_limit(m, 512)
         tk = round_up_to_multiple_of_128_within_limit(k, 2048)
         tn = round_up_to_multiple_of_128_within_limit(n, 2048)

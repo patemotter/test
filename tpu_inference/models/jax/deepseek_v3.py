@@ -879,8 +879,8 @@ class DeepSeekV3(nnx.Module):
                 dtype=dtype,
                 moe_backend=self.moe_backend,
                 activation_ffw_td=(ShardingAxisName.MLP_DATA, None),
-                ed_sharding=(None, None),
-                e_sharding=(None, ))
+                ed_sharding=(ShardingAxisName.MLP_TENSOR, None),
+                e_sharding=(ShardingAxisName.MLP_TENSOR, ))
             custom_module = MoE(
                 dtype=dtype,
                 num_local_experts=num_local_experts,
