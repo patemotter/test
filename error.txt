@@ -1,0 +1,62 @@
+USE_2D_TP=1 USE_MEGABLOCKS=1 VLLM_MLA_DISABLE=1 NEW_MODEL_DESIGN=1 TPU_BACKEND_TYPE=jax     vllm serve --model=deepseek-ai/DeepSeek-R1 --max-model-len=5120 --max-num-batched-tokens 128 --max-num-seqs=128 --no-enable-prefix-caching --disable-log-requests --gpu-memory-utilization 0.9 --tensor-parallel-size 2 --additional_config='{"skip_quantization": "True", "sharding": {"sharding_strategy": {"expert_parallelism": 4, "tensor_parallelism": 2}}}' --kv-cache-dtype=fp8 --load-format=dummy --hf_overrides  '{"num_hidden_layers": 20}'
+
+EngineCore failed to start.
+Traceback (most recent call last):
+  File "/mnt/disks/persist/ullm/vllm/vllm/v1/engine/core.py", line 926, in run_engine_core
+    engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/disks/persist/ullm/vllm/vllm/v1/engine/core.py", line 691, in __init__
+    super().__init__(
+  File "/mnt/disks/persist/ullm/vllm/vllm/v1/engine/core.py", line 112, in __init__
+    num_gpu_blocks, num_cpu_blocks, kv_cache_config = self._initialize_kv_caches(
+                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/disks/persist/ullm/vllm/vllm/v1/engine/core.py", line 269, in _initialize_kv_caches
+    self.model_executor.initialize_from_config(kv_cache_configs)
+  File "/mnt/disks/persist/ullm/vllm/vllm/v1/executor/abstract.py", line 116, in initialize_from_config
+    self.collective_rpc("compile_or_warm_up_model")
+  File "/mnt/disks/persist/ullm/vllm/vllm/v1/executor/uniproc_executor.py", line 75, in collective_rpc
+    result = run_method(self.driver_worker, method, args, kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/disks/persist/ullm/vllm/vllm/v1/serial_utils.py", line 461, in run_method
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/disks/persist/my_tpu_inference/tpu_inference/worker/tpu_worker.py", line 360, in compile_or_warm_up_model
+    self.model_runner.capture_model()
+  File "/mnt/disks/persist/my_tpu_inference/tpu_inference/runner/tpu_runner.py", line 549, in capture_model
+    self.compilation_manager.capture_model()
+  File "/mnt/disks/persist/my_tpu_inference/tpu_inference/runner/compilation_manager.py", line 93, in capture_model
+    self._precompile_backbone_text_only()
+  File "/mnt/disks/persist/my_tpu_inference/tpu_inference/runner/compilation_manager.py", line 327, in _precompile_backbone_text_only
+    self._precompile_backbone_helper(
+  File "/mnt/disks/persist/my_tpu_inference/tpu_inference/runner/compilation_manager.py", line 233, in _precompile_backbone_helper
+    self._run_compilation(
+  File "/mnt/disks/persist/my_tpu_inference/tpu_inference/runner/compilation_manager.py", line 77, in _run_compilation
+    result = fn(*args)
+             ^^^^^^^^^
+  File "/mnt/disks/persist/my_tpu_inference/tpu_inference/runner/compilation_manager.py", line 218, in model_fn_wrapper
+    kv_caches, hidden_states, _ = self.runner.model_fn(
+                                  ^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/disks/persist/my_tpu_inference/tpu_inference/models/common/model_loader.py", line 275, in run_model
+    return model(*args)
+           ^^^^^^^^^^^^
+  File "/mnt/disks/persist/my_tpu_inference/tpu_inference/models/jax/deepseek_v3.py", line 1011, in __call__
+    new_kv_cache, x = block(x, is_prefill, kv_cache,
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/disks/persist/my_tpu_inference/tpu_inference/layers/jax/transformer_block.py", line 49, in __call__
+    new_cache, attn_output_TD = self.attn(x_TD, is_prefill, kv_cache,
+                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/disks/persist/my_tpu_inference/tpu_inference/layers/jax/attention/deepseek_v3_attention.py", line 317, in __call__
+    new_kv_cache, outputs_TNH = self.attention(
+                                ^^^^^^^^^^^^^^^
+  File "/mnt/disks/persist/my_tpu_inference/tpu_inference/layers/jax/attention/deepseek_v3_attention.py", line 418, in attention
+    output_TNH, kv_cache = jax.jit(
+                           ^^^^^^^^
+  File "/mnt/disks/persist/my_tpu_inference/tpu_inference/layers/jax/attention/deepseek_v3_attention.py", line 409, in _ragged_paged_attention
+    outputs = ragged_paged_attention(
+              ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/disks/persist/my_tpu_inference/tpu_inference/kernels/ragged_paged_attention/v3/kernel.py", line 1417, in ragged_paged_attention
+    static_validate_inputs(
+  File "/mnt/disks/persist/my_tpu_inference/tpu_inference/kernels/ragged_paged_attention/v3/kernel.py", line 1278, in static_validate_inputs
+    raise ValueError(
+ValueError: Invalid num_kv_heads_x2=128, actual_num_kv_heads=16, kv_packing=4
+--------------------
