@@ -23,6 +23,7 @@ from vllm.config import VllmConfig
 
 from tpu_inference import utils
 from tpu_inference.layers.common.attention_interface import attention
+from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.quantization import quantize_kv
 from tpu_inference.layers.jax import JaxModule
@@ -59,7 +60,8 @@ class Qwen3Attention(JaxModule):
                                          self.hidden_size // self.num_heads)
         self.head_dim = utils.get_padded_head_dim(self.head_dim_original)
 
-        sharding_size = mesh.shape["model"]
+        sharding_size = utils.get_mesh_shape_product(mesh,
+                                                     ShardingAxisName.ATTN_HEAD)
         self.num_heads = utils.get_padded_num_heads(self.num_heads,
                                                     sharding_size)
         self.num_kv_heads = utils.get_padded_num_heads(self.num_kv_heads,

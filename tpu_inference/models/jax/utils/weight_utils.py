@@ -34,6 +34,7 @@ from safetensors import safe_open
 from vllm.config import VllmConfig
 
 from tpu_inference import envs, utils
+from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.utils import file_utils
 
@@ -221,7 +222,7 @@ def shard_put(x: jax.Array, shardings, mesh: jax.sharding.Mesh) -> jax.Array:
 def get_default_maps(model_config, mesh: Mesh,
                      name_map: dict[str, str]) -> MetadataMap:
     """Load weights from one model weights file to the model, run on single thread."""
-    sharding_size = mesh.shape["model"]
+    sharding_size = utils.get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
 
     hf_config = model_config.hf_config
 

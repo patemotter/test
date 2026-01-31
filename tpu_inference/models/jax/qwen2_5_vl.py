@@ -30,6 +30,7 @@ from vllm.config import VllmConfig
 from tpu_inference import utils as utils
 from tpu_inference.layers.common.attention_interface import \
     sharded_flash_attention
+from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.jax.linear import JaxEinsum
 from tpu_inference.logger import init_logger
@@ -209,7 +210,8 @@ class Qwen2_5_VisionAttention(nnx.Module):
         self.rope_scaling = getattr(config, "rope_scaling", None)
         self.head_dim_original = self.hidden_size // self.num_heads
 
-        sharding_size = mesh.shape["model"]
+        sharding_size = utils.get_mesh_shape_product(mesh,
+                                                     ShardingAxisName.ATTN_HEAD)
         self.num_heads = utils.get_padded_num_heads(self.num_heads,
                                                     sharding_size)
         self.num_kv_heads = utils.get_padded_num_heads(self.num_kv_heads,

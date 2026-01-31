@@ -167,9 +167,10 @@ class KVCacheManager:
                     self.shared_kv_cache_layers[layer_name] = kv_tgt_layer
                     continue
                 if attn_module.attn_type == AttentionType.DECODER:
+                    tp_size = common_utils.get_mesh_shape_product(
+                        self.runner.mesh, ShardingAxisName.ATTN_HEAD)
                     num_kv_heads = common_utils.get_padded_num_heads(
-                        attn_module.num_kv_heads,
-                        self.runner.mesh.shape["model"])
+                        attn_module.num_kv_heads, tp_size)
                     head_size = common_utils.get_padded_head_dim(
                         attn_module.head_size)
 

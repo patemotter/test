@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 from tpu_inference import utils
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
 from tpu_inference.runner.kv_cache import (DEFAULT_KV_CACHE_DTYPE,
                                            create_kv_caches)
@@ -359,8 +360,9 @@ def apply_qwix_quantization(
     model_config = vllm_config.model_config
 
     # Pad num_kv_heads to multiple of TP size
+    tp_size = utils.get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
     num_kv_heads = utils.get_padded_num_heads(
-        model_config.get_total_num_kv_heads(), mesh.shape["model"])
+        model_config.get_total_num_kv_heads(), tp_size)
 
     # Pad head_dim to multiple of 128
     head_size = model_config.get_head_size()
