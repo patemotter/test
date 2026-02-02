@@ -581,7 +581,8 @@ def update_vllm_config_for_qwix_quantization(vllm_config: "VllmConfig"):
 
 def get_random_sharded_array(key: PRNGKey, mesh: Mesh, param: nnx.Param,
                              param_shape: tuple, dtype: jnp.dtype,
-                             param_name: str) -> jax.Array:
+                             param_name: str,
+                             sharding_override: tuple = None) -> jax.Array:
     """
     Returns a random sharded array for the given parameter for the given shape.
 
@@ -592,6 +593,9 @@ def get_random_sharded_array(key: PRNGKey, mesh: Mesh, param: nnx.Param,
         param_shape: The shape of the parameter.
         dtype: The dtype of the parameter.
         param_name: The name of the parameter.
+        sharding_override: Optional sharding to use instead of param.sharding.
+            This is used to specify correct sharding for scale tensors that
+            need to match the PartitionSpecs expected by shard_map in MoE layers.
 
     Returns:
         A random sharded array for the given parameter for the given shape.
@@ -615,12 +619,14 @@ def get_random_sharded_array(key: PRNGKey, mesh: Mesh, param: nnx.Param,
     def get_slice(index):
         return weight[index]
 
+    # Use sharding_override if provided, otherwise use param.sharding
+    sharding = sharding_override if sharding_override is not None else param.sharding
     try:
         sharded_array = jax.make_array_from_callback(
-            param_shape, NamedSharding(mesh, P(*param.sharding)), get_slice)
+            param_shape, NamedSharding(mesh, P(*sharding)), get_slice)
     except (ValueError, TypeError):
         logger.warning(
-            f"Could not create sharded scale for {param_name} with shape {param_shape} and sharding {param.sharding}, skipping sharding..."
+            f"Could not create sharded scale for {param_name} with shape {param_shape} and sharding {sharding}, skipping sharding..."
         )
         sharded_array = jax.make_array_from_callback(param_shape,
                                                      NamedSharding(mesh, P()),
@@ -648,6 +654,9 @@ def load_random_weights_into_qwix_abstract_model(rng: PRNGKey,
     scale_shape_map = model.weight_loader.scale_shape_map_for_random_weight_loading if hasattr(
         model.weight_loader,
         'scale_shape_map_for_random_weight_loading') else {}
+    scale_sharding_map = model.weight_loader.scale_sharding_map_for_random_weight_loading if hasattr(
+        model.weight_loader,
+        'scale_sharding_map_for_random_weight_loading') else {}
     quantization_block_sizes = quantization_config["weight_block_size"]
     assert len(
         quantization_block_sizes
@@ -664,6 +673,7 @@ def load_random_weights_into_qwix_abstract_model(rng: PRNGKey,
         is_qwix_scale = (path[-1] == 'scale' and path[-2] == "array")
         param_dtype = scale_dtype if is_qwix_scale else param.value.dtype
         param_shape = param.value.shape
+        sharding_override = None
         if is_qwix_scale:
             key = f"{path[2]}.{path[3]}"
 
@@ -672,9 +682,12 @@ def load_random_weights_into_qwix_abstract_model(rng: PRNGKey,
             else:
                 raise ValueError(
                     f"Scale shape for {key} not found in scale_shape_map.")
+            # Use the sharding override for scale tensors if available
+            if key in scale_sharding_map:
+                sharding_override = scale_sharding_map[key]
         param.value = get_random_sharded_array(
             rng, mesh, param, param_shape, param_dtype,
-            ".".join([str(x) for x in path]))
+            ".".join([str(x) for x in path]), sharding_override)
 
     # Handles the DeepSeek case, where this needs to be called to make the cache weights
     # concrete

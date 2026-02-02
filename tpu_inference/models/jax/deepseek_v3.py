@@ -228,6 +228,34 @@ class DeepSeekV3WeightLoader(BaseWeightLoader):
                 "attn.kernel_v_up_proj_ANH": (2, 128, 128),  # MLA
             }
 
+            # Sharding specifications for scale tensors during random weight loading
+            # These must match the PartitionSpecs used in shard_map in_specs for MoE layers
+            # MoE weights use edf_sharding=(None, MODEL_1, MODEL_2) and efd_sharding=(None, MODEL_2, MODEL_1)
+            # Scale specs drop the middle dimension: (edf_sharding[0], None, edf_sharding[2])
+            self.scale_sharding_map_for_random_weight_loading = {
+                # MoE experts (3D) - scales need proper sharding for shard_map
+                # kernel_gating_EDF and kernel_up_proj_EDF use edf_sharding, scale is (None, None, 'expert')
+                "custom_module.kernel_gating_EDF": (None, None, ShardingAxisName.MODEL_2),
+                "custom_module.kernel_up_proj_EDF": (None, None, ShardingAxisName.MODEL_2),
+                # kernel_down_proj_EFD uses efd_sharding, scale is (None, None, 'model')
+                "custom_module.kernel_down_proj_EFD": (None, None, ShardingAxisName.MODEL_1),
+                # Shared experts and Dense FFW use MLP_TENSOR sharding
+                "shared_experts.kernel_down_proj_FD": (None, ShardingAxisName.MLP_TENSOR),
+                "shared_experts.kernel_gating_DF": (None, ShardingAxisName.MLP_TENSOR),
+                "shared_experts.kernel_up_proj_DF": (None, ShardingAxisName.MLP_TENSOR),
+                "custom_module.kernel_gating_DF": (None, ShardingAxisName.MLP_TENSOR),
+                "custom_module.kernel_up_proj_DF": (None, ShardingAxisName.MLP_TENSOR),
+                "custom_module.kernel_down_proj_FD": (ShardingAxisName.MLP_TENSOR, None),
+                # Attention - use appropriate sharding based on weight layout
+                "attn.kernel_q_down_proj_DA": (None, ShardingAxisName.MLP_TENSOR),
+                "attn.kernel_q_up_proj_AP": (None, ShardingAxisName.MLP_TENSOR),
+                "attn.kernel_kv_down_proj_DA": (None, ShardingAxisName.MLP_TENSOR),
+                "attn.kernel_kv_up_proj_AL": (None, ShardingAxisName.MLP_TENSOR),
+                "attn.kernel_o_proj_RD": (ShardingAxisName.MLP_TENSOR, None),
+                "attn.kernel_k_up_proj_ANH": (None, ShardingAxisName.MLP_TENSOR, None),
+                "attn.kernel_v_up_proj_ANH": (None, ShardingAxisName.MLP_TENSOR, None),
+            }
+
             # TODO (jacobplatin): remove this check eventually!
             assert self.quant_dtype == jnp.float8_e4m3fn, f"Expected quant_dtype to be float8_e4m3fn for DeepSeek but got {self.quant_dtype}"
 
